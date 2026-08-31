@@ -1,0 +1,37 @@
+{
+  "id": "kanban",
+  "name": "Kanban",
+  "version": "0.2.0",
+  "description": "Kanban boards you can share: drag-and-drop lists and cards, labels, and live collaboration with people on their own M\u00f6bius.",
+  "author": "mobius-os",
+  "license": "MIT",
+  "homepage": "https://github.com/mobius-os/app-kanban",
+  "entry": "index.jsx",
+  "icon": "icon.png",
+  "offline_capable": true,
+  "permissions": {
+    "cross_app_access": "none",
+    "share_with_apps": "none"
+  },
+  "runtime": {
+    "imports": [
+      "react",
+      "react-dom",
+      "@openai/apps-sdk-ui/components/Icon"
+    ],
+    "esm_deps": []
+  },
+  "offline": {
+    "reads": true,
+    "writes": "queued",
+    "execution": "full"
+  },
+  "source_files": [
+    "domain.js",
+    "storage.js",
+    "sync.js",
+    "theme.js",
+    "ui/Home.jsx",
+    "ui/Board.jsx"
+  ]
+}

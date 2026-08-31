@@ -1,0 +1,159 @@
+// Data layer for Kanban boards.
+//
+// Layout: one document per board at `boards/<id>.json`. No shared index file —
+// the board list is enumerated with storage.list(), so creating or deleting a
+// board never contends with another writer.
+//
+// Version tolerance contract (important for mixed app versions):
+// - Every document carries a schema version `v`.
+// - Readers NORMALIZE known fields in memory and PRESERVE unknown fields.
+// - Writers never rebuild a document from scratch: every mutation is an op
+//   applied to the freshest server copy under compare-and-swap, touching only
+//   the fields it knows about. A newer app version's extra fields survive a
+//   round-trip through an older app version.
+
+export const SCHEMA_V = 1
+
+export const uid = () =>
+  `${Date.now().toString(36)}${Math.random().toString(36).slice(2, 8)}`
+
+const store = () => window.mobius?.storage
+
+export function newBoardDoc(title) {
+  return {
+    v: SCHEMA_V,
+    id: uid(),
+    title: title || 'New board',
+    createdAt: new Date().toISOString(),
+    columns: [
+      { id: uid(), name: 'To do', cardIds: [] },
+      { id: uid(), name: 'In progress', cardIds: [] },
+      { id: uid(), name: 'Done', cardIds: [] },
+    ],
+    cards: {},
+  }
+}
+
+// Tolerant reader: fill defaults for known fields, keep everything else as-is.
+export function normalizeBoard(doc) {
+  if (!doc || typeof doc !== 'object' || Array.isArray(doc)) return null
+  if (typeof doc.v !== 'number') doc.v = 1
+  if (typeof doc.title !== 'string') doc.title = 'Board'
+  if (!Array.isArray(doc.columns)) doc.columns = []
+  doc.columns = doc.columns.filter(col => col && typeof col === 'object' && !Array.isArray(col))
+  if (!doc.cards || typeof doc.cards !== 'object' || Array.isArray(doc.cards)) doc.cards = {}
+  for (const col of doc.columns) {
+    if (!Array.isArray(col.cardIds)) col.cardIds = []
+    if (typeof col.name !== 'string') col.name = 'List'
+  }
+  return doc
+}
+
+export const boardPath = id => `boards/${id}.json`
+
+export async function listBoards() {
+  const s = store()
+  if (!s) return []
+  const entries = await s.list('boards/', { includeContent: true })
+  const boards = []
+  for (const e of entries) {
+    if (!e.name.endsWith('.json')) continue
+    let doc = e.content
+    if (doc === undefined || doc === null) {
+      try { doc = await s.get(e.path.replace(/^.*?boards\//, 'boards/')) } catch { doc = null }
+    }
+    doc = normalizeBoard(doc)
+    if (doc) {
+      boards.push({
+        id: e.name.replace(/\.json$/, ''),
+        title: doc.title,
+        cardCount: Object.keys(doc.cards).length,
+        columnCount: doc.columns.length,
+        createdAt: String(doc.createdAt || ''),
+      })
+    }
+  }
+  boards.sort((a, b) => a.createdAt.localeCompare(b.createdAt))
+  return boards
+}
+
+export async function createBoard(title) {
+  const doc = newBoardDoc(title)
+  await store().durableWrite(boardPath(doc.id), doc, { ifNoneMatch: true })
+  return doc.id
+}
+
+export async function deleteBoard(id) {
+  await store().remove(boardPath(id))
+}
+
+export function subscribeBoard(id, cb) {
+  const s = store()
+  if (!s) return () => {}
+  return s.subscribe(boardPath(id), v => cb(normalizeBoard(v)))
+}
+
+export async function getBoard(id) {
+  return normalizeBoard(await store().get(boardPath(id)))
+}
+
+// Apply `op` to the freshest server copy with CAS retry. `op` mutates the doc
+// in place (or returns a replacement) and must only touch fields it owns.
+// A missing document aborts the write: mutating a deleted board must never
+// resurrect it.
+export async function casMutate(id, op, onError) {
+  const s = store()
+  if (!s) return null
+  for (let attempt = 0; attempt < 6; attempt++) {
+    try {
+      const { value, version } = await s.getWithVersion(boardPath(id))
+      const base = normalizeBoard(value)
+      if (!base) return null
+      const next = op(base) || base
+      await s.durableWrite(boardPath(id), next, { ifMatch: version })
+      return next
+    } catch (e) {
+      if (e?.code === 'conflict') continue
+      onError?.(e)
+      return null
+    }
+  }
+  onError?.(new Error('Could not save after repeated conflicts'))
+  return null
+}
+
+// Create the first board exactly once even when several app frames race:
+// the fixed document id makes concurrent seeds collide on if-none-match.
+export async function seedFirstBoard() {
+  const doc = newBoardDoc('My board')
+  doc.id = 'welcome'
+  try {
+    await store().durableWrite(boardPath(doc.id), doc, { ifNoneMatch: true })
+  } catch (e) {
+    if (e?.code !== 'conflict') throw e
+  }
+}
+
+// One-time migration from the v0 single-board layout (`board.json`).
+export async function migrateLegacy() {
+  const s = store()
+  if (!s) return
+  try {
+    const legacy = await s.get('board.json')
+    if (!legacy) return
+    const doc = normalizeBoard(structuredClone(legacy))
+    doc.v = SCHEMA_V
+    // Deterministic id: concurrent migrators collide on if-none-match instead
+    // of each minting a fresh id and duplicating the board.
+    doc.id = doc.id && typeof doc.id === 'string' ? doc.id : 'migrated-v0'
+    doc.createdAt = doc.createdAt || new Date().toISOString()
+    try {
+      await s.durableWrite(boardPath(doc.id), doc, { ifNoneMatch: true })
+    } catch (e) {
+      if (e?.code !== 'conflict') throw e // already migrated elsewhere
+    }
+    await s.remove('board.json')
+  } catch {
+    // Non-fatal: legacy board stays readable on next launch.
+  }
+}
