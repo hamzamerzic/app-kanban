@@ -1,8 +1,21 @@
 import { useEffect, useRef, useState, useCallback } from 'react'
-import { Plus, Trash, ChevronLeft, Share } from '@openai/apps-sdk-ui/components/Icon'
-import { uid, subscribeBoard, getBoard, casMutate, boardPath } from '../storage.js'
+import { Check, ChevronDown, ChevronLeft, Filter, Grid, Plus, Share, Trash } from '@openai/apps-sdk-ui/components/Icon'
+import { uid, subscribeBoard, getBoard, casMutate, boardPath, normalizeBoard } from '../storage.js'
 import { pullShared, pushSharedOp, inviteByHandle, getMembers, revokeMember, shareBoard } from '../sync.js'
-import { boardAccess } from '../domain.js'
+import {
+  addChecklistItem,
+  assigneeAvatar,
+  boardAccess,
+  cardMatchesFilters,
+  checklistProgress,
+  defaultColumnColor,
+  deleteChecklistItem,
+  dueDateStatus,
+  formatDueDate,
+  swapColumns,
+  toggleChecklistItem,
+  visibleToFullIndex,
+} from '../domain.js'
 
 export const LABELS = {
   none: 'transparent',
@@ -15,6 +28,10 @@ export const LABELS = {
 }
 
 function Card({ card, lifted, onOpen, onDragStart, canWrite }) {
+  const dueStatus = dueDateStatus(card.due)
+  const progress = checklistProgress(card.checklist)
+  const assignee = card.assignee?.trim()
+  const avatar = assignee ? assigneeAvatar(assignee) : null
   return (
     <div
       className={`kb-card${lifted ? ' kb-lifted' : ''}${canWrite ? '' : ' kb-readonly'}`}
@@ -29,7 +46,197 @@ function Card({ card, lifted, onOpen, onDragStart, canWrite }) {
         <div className="kb-label" style={{ background: LABELS[card.label] || LABELS.none }} />
       )}
       <div className="kb-card-title">{card.title}</div>
-      {card.notes ? <div className="kb-card-notes">{card.notes}</div> : null}
+      {(dueStatus || progress.total > 0 || avatar) && <div className="kb-card-meta">
+        {dueStatus && <span className={`kb-due kb-due-${dueStatus}`}>{formatDueDate(card.due)}</span>}
+        {progress.total > 0 && <div className="kb-check-progress">
+          <span>{progress.done}/{progress.total}</span>
+          <span
+            className="kb-progress-track"
+            role="progressbar"
+            aria-label={`${progress.done} of ${progress.total} checklist items complete`}
+            aria-valuemin={0}
+            aria-valuemax={progress.total}
+            aria-valuenow={progress.done}
+          >
+            <span className="kb-progress-fill" style={{ width: `${progress.percent}%` }} />
+          </span>
+        </div>}
+        <span className="kb-card-meta-spacer" />
+        {avatar && <span
+          className="kb-avatar"
+          style={{ background: avatar.background, color: avatar.color }}
+          title={assignee}
+          role="img"
+          aria-label={`Assigned to ${assignee}`}
+        >{avatar.initials}</span>}
+      </div>}
+    </div>
+  )
+}
+
+function memberDisplayNames(metadata) {
+  const members = metadata?.members
+    ?? metadata?.metadata?.members
+    ?? metadata?.member_names
+    ?? metadata?.metadata?.member_names
+  const values = Array.isArray(members)
+    ? members
+    : members && typeof members === 'object' ? Object.values(members) : []
+  return [...new Set(values.map(member => {
+    if (typeof member === 'string') return member.trim()
+    return String(member?.displayName || member?.display_name || member?.name || '').trim()
+  }).filter(Boolean))]
+}
+
+function BoardSwitcher({ board, boardId, boards, shareMap, canWrite, open, onOpenChange, onRename, onSelect, onCreate }) {
+  useEffect(() => {
+    if (!open) return undefined
+    const onKey = event => { if (event.key === 'Escape') onOpenChange(false) }
+    window.addEventListener('keydown', onKey)
+    return () => window.removeEventListener('keydown', onKey)
+  }, [open, onOpenChange])
+
+  const cardCount = Object.keys(board.cards).length
+  const commitTitle = target => {
+    const title = target.value.trim()
+    if (title && title !== board.title) onRename(title)
+    else target.value = board.title
+  }
+
+  return (
+    <div className="kb-switcher-wrap">
+      <button
+        className="kb-switcher-button"
+        aria-label={`Switch board, current board ${board.title}`}
+        aria-haspopup="dialog"
+        aria-expanded={open}
+        onClick={() => onOpenChange(!open)}
+      >
+        <span>{board.title}</span>
+        <ChevronDown />
+      </button>
+      {open && <>
+        <div className="kb-scrim kb-switcher-scrim" onClick={() => onOpenChange(false)} />
+        <div className="kb-sheet kb-switcher-panel" role="dialog" aria-label="Switch boards">
+          <div className="kb-sheet-grab" />
+          <input
+            className="kb-input kb-switcher-title"
+            defaultValue={board.title}
+            key={`switch-title-${board.title}`}
+            aria-label="Current board name"
+            readOnly={!canWrite}
+            onBlur={event => commitTitle(event.currentTarget)}
+            onKeyDown={event => { if (event.key === 'Enter') event.currentTarget.blur() }}
+          />
+          <div className="kb-switcher-rows">
+            {boards.map(item => {
+              const current = item.id === boardId
+              const title = current ? board.title : item.title
+              const count = current ? cardCount : item.cardCount
+              return <button
+                key={item.id}
+                className={`kb-switcher-row${current ? ' kb-current' : ''}`}
+                aria-current={current ? 'page' : undefined}
+                onClick={() => {
+                  if (!current) onSelect(item.id)
+                  onOpenChange(false)
+                }}
+              >
+                <span className="kb-switcher-row-main">
+                  <span className="kb-switcher-row-title">{title}</span>
+                  <span className="kb-switcher-row-meta">
+                    {count === 1 ? '1 card' : `${count} cards`}
+                    {shareMap[item.id] && <span className="kb-shared-tag">shared</span>}
+                  </span>
+                </span>
+                {current && <Check />}
+              </button>
+            })}
+            <button className="kb-switcher-row kb-switcher-new" onClick={() => { onOpenChange(false); onCreate() }}>
+              <Plus />
+              <span className="kb-switcher-row-title">New board</span>
+            </button>
+          </div>
+        </div>
+      </>}
+    </div>
+  )
+}
+
+function AssigneeEditor({ card, canWrite, suggestions, onUpdate }) {
+  const [value, setValue] = useState(card.assignee || '')
+  useEffect(() => { setValue(card.assignee || '') }, [card.id, card.assignee])
+  const commit = nextValue => {
+    const next = String(nextValue).trim()
+    setValue(next)
+    if (next !== (card.assignee || '')) onUpdate(next)
+  }
+  return (
+    <div className="kb-assignee-editor">
+      <input
+        className="kb-input"
+        value={value}
+        placeholder="Display name…"
+        aria-label="Card assignee"
+        readOnly={!canWrite}
+        onChange={event => setValue(event.target.value)}
+        onBlur={() => commit(value)}
+        onKeyDown={event => { if (event.key === 'Enter') event.currentTarget.blur() }}
+      />
+      {canWrite && suggestions.length > 0 && <div className="kb-chips kb-assignee-suggestions" aria-label="Board members">
+        {suggestions.map(name => <button
+          key={name}
+          className="kb-chip"
+          type="button"
+          onClick={() => commit(name)}
+        >{name}</button>)}
+      </div>}
+    </div>
+  )
+}
+
+function ChecklistEditor({ checklist, canWrite, onAdd, onToggle, onDelete }) {
+  const [text, setText] = useState('')
+  const submit = () => {
+    const value = text.trim()
+    if (!value || !canWrite) return
+    onAdd(value)
+    setText('')
+  }
+  return (
+    <div className="kb-checklist">
+      {checklist.map(item => (
+        <div className="kb-check-item" key={item.id}>
+          <label className="kb-check-toggle">
+            <input
+              type="checkbox"
+              checked={item.done}
+              disabled={!canWrite}
+              onChange={() => onToggle(item.id)}
+            />
+            <span className={item.done ? 'kb-check-done' : ''}>{item.text}</span>
+          </label>
+          {canWrite && <button
+            className="kb-iconbtn"
+            aria-label={`Delete checklist item ${item.text}`}
+            onClick={() => onDelete(item.id)}
+          >
+            <Trash />
+          </button>}
+        </div>
+      ))}
+      {canWrite && <div className="kb-check-add">
+        <input
+          className="kb-input"
+          value={text}
+          placeholder="Add checklist item…"
+          aria-label="New checklist item"
+          onChange={event => setText(event.target.value)}
+          onKeyDown={event => { if (event.key === 'Enter') { event.preventDefault(); submit() } }}
+        />
+        <button className="kb-btn kb-btn-primary" disabled={!text.trim()} onClick={submit}>Add</button>
+      </div>}
+      {!checklist.length && !canWrite && <div className="kb-empty">No checklist items</div>}
     </div>
   )
 }
@@ -189,7 +396,18 @@ function Composer({ onAdd, onClose }) {
   )
 }
 
-export default function Board({ boardId, onBack, online, share, onShared }) {
+export default function Board({
+  boardId,
+  boards,
+  shareMap,
+  onAllBoards,
+  onSwitchBoard,
+  onCreateBoard,
+  onBoardRenamed,
+  online,
+  share,
+  onShared,
+}) {
   const [board, setBoard] = useState(null)
   const [composerCol, setComposerCol] = useState(null)
   const [openCardId, setOpenCardId] = useState(null)
@@ -197,8 +415,15 @@ export default function Board({ boardId, onBack, online, share, onShared }) {
   const [drag, setDrag] = useState(null)
   const [shareOpen, setShareOpen] = useState(false)
   const [syncNote, setSyncNote] = useState('')
+  const [filtersOpen, setFiltersOpen] = useState(false)
+  const [filterText, setFilterText] = useState('')
+  const [filterLabels, setFilterLabels] = useState([])
+  const [switcherOpen, setSwitcherOpen] = useState(false)
+  const [memberNames, setMemberNames] = useState([])
+  const [animateColumns, setAnimateColumns] = useState(true)
 
   const boardRef = useRef(null)
+  const boardScrollRef = useRef(null)
   const pendingRef = useRef(0)
   const writeChain = useRef(Promise.resolve())
   const dragRef = useRef(null)
@@ -206,9 +431,32 @@ export default function Board({ boardId, onBack, online, share, onShared }) {
   const versionRef = useRef(-1)
   const shareRef = useRef(share)
   const onlineRef = useRef(online)
+  const filtersRef = useRef({ text: filterText, labels: filterLabels })
   boardRef.current = board
   shareRef.current = share
   onlineRef.current = online
+  filtersRef.current = { text: filterText, labels: filterLabels }
+
+  useEffect(() => {
+    if (!board || !animateColumns) return undefined
+    if (board.columns.length === 0) {
+      setAnimateColumns(false)
+      return undefined
+    }
+    const timer = setTimeout(() => setAnimateColumns(false), 185 + board.columns.length * 25)
+    return () => clearTimeout(timer)
+  }, [!!board, animateColumns])
+
+  useEffect(() => {
+    let alive = true
+    setMemberNames([])
+    if (share?.hosted) {
+      getMembers(share.oid).then(result => {
+        if (alive) setMemberNames(memberDisplayNames(result))
+      }).catch(() => {})
+    }
+    return () => { alive = false }
+  }, [share?.hosted, share?.oid])
 
   useEffect(() => {
     let unsub = null
@@ -243,8 +491,13 @@ export default function Board({ boardId, onBack, online, share, onShared }) {
         if (state.version < versionRef.current) return
         versionRef.current = state.version
         if (state.doc) {
-          window.mobius?.storage?.set(boardPath(boardId), state.doc).catch(() => {})
-          if (pendingRef.current === 0 && !dragRef.current) setBoard(state.doc)
+          const normalized = normalizeBoard(state.doc)
+          window.mobius?.storage?.set(boardPath(boardId), normalized).catch(() => {})
+          if (pendingRef.current === 0 && !dragRef.current) setBoard(normalized)
+        }
+        if (!share.hosted && state.object) {
+          const names = memberDisplayNames(state.object)
+          if (names.length) setMemberNames(names)
         }
         setSyncNote('')
       } catch (e) {
@@ -306,10 +559,11 @@ export default function Board({ boardId, onBack, online, share, onShared }) {
 
   const addCard = (colId, title) => {
     const id = uid()
+    const createdAt = new Date().toISOString()
     const queued = mutate(b => {
       const col = b.columns.find(c => c.id === colId)
       if (!col) return b
-      b.cards[id] = { id, title, notes: '', label: 'none', createdAt: new Date().toISOString() }
+      b.cards[id] = { id, title, notes: '', label: 'none', due: '', checklist: [], assignee: '', createdAt }
       col.cardIds.push(id)
       return b
     })
@@ -320,6 +574,31 @@ export default function Board({ boardId, onBack, online, share, onShared }) {
     mutate(b => {
       if (!b.cards[cardId]) return b
       Object.assign(b.cards[cardId], patch)
+      return b
+    })
+  }
+
+  const addCheckItem = (cardId, text) => {
+    const item = { id: uid(), text, done: false }
+    mutate(b => {
+      const card = b.cards[cardId]
+      if (card) card.checklist = addChecklistItem(card.checklist, item)
+      return b
+    })
+  }
+
+  const toggleCheckItem = (cardId, itemId) => {
+    mutate(b => {
+      const card = b.cards[cardId]
+      if (card) card.checklist = toggleChecklistItem(card.checklist, itemId)
+      return b
+    })
+  }
+
+  const removeCheckItem = (cardId, itemId) => {
+    mutate(b => {
+      const card = b.cards[cardId]
+      if (card) card.checklist = deleteChecklistItem(card.checklist, itemId)
       return b
     })
   }
@@ -348,7 +627,10 @@ export default function Board({ boardId, onBack, online, share, onShared }) {
 
   const addColumn = () => {
     const id = uid()
-    mutate(b => { b.columns.push({ id, name: 'New list', cardIds: [] }); return b })
+    mutate(b => {
+      b.columns.push({ id, name: 'New list', color: defaultColumnColor(b.columns.length), cardIds: [] })
+      return b
+    })
   }
 
   const renameColumn = (colId, name) => {
@@ -370,7 +652,18 @@ export default function Board({ boardId, onBack, online, share, onShared }) {
     })
   }
 
-  const renameBoard = title => mutate(b => { b.title = title || b.title; return b })
+  const reorderColumn = (colId, offset) => {
+    mutate(b => {
+      b.columns = swapColumns(b.columns, colId, offset)
+      return b
+    })
+  }
+
+  const renameBoard = title => {
+    const next = title.trim()
+    if (!next || next === boardRef.current?.title) return
+    if (mutate(b => { b.title = next; return b })) onBoardRenamed(boardId, next)
+  }
 
   // ---- drag & drop (pointer events; long-press on touch) ----
   const startDrag = (e, cardId) => {
@@ -381,10 +674,12 @@ export default function Board({ boardId, onBack, online, share, onShared }) {
     const start = { x: e.clientX, y: e.clientY }
     let active = false
     let holdTimer = null
+    let scrollFrame = null
+    let pointer = { ...start }
 
-    const begin = () => {
-      active = true
-      rectsRef.current = Array.from(document.querySelectorAll('[data-col-id]')).map(c => ({
+    const measure = () => {
+      const root = boardScrollRef.current
+      rectsRef.current = Array.from(root?.querySelectorAll('[data-col-id]') || []).map(c => ({
         id: c.dataset.colId,
         rect: c.getBoundingClientRect(),
         cardEls: Array.from(c.querySelectorAll('[data-card-id]')).map(cc => ({
@@ -392,6 +687,11 @@ export default function Board({ boardId, onBack, online, share, onShared }) {
           rect: cc.getBoundingClientRect(),
         })),
       }))
+    }
+
+    const begin = () => {
+      active = true
+      measure()
       const b = boardRef.current
       const fromCol = b.columns.find(c => c.cardIds.includes(cardId))?.id
       const d = {
@@ -405,6 +705,7 @@ export default function Board({ boardId, onBack, online, share, onShared }) {
       }
       dragRef.current = d
       setDrag({ ...d })
+      scrollFrame = requestAnimationFrame(autoScroll)
       navigator.vibrate?.(10)
     }
 
@@ -424,7 +725,41 @@ export default function Board({ boardId, onBack, online, share, onShared }) {
       return { overCol: over.id, overIndex: idx }
     }
 
+    const updatePosition = (x, y) => {
+      const { overCol, overIndex } = locate(x, y)
+      const d = dragRef.current
+      if (!d) return
+      Object.assign(d, { x, y, overCol, overIndex, moved: true })
+      setDrag({ ...d })
+    }
+
+    function autoScroll() {
+      const scroller = boardScrollRef.current
+      const d = dragRef.current
+      if (!active || !scroller || !d) return
+      if (d.moved) {
+        const bounds = scroller.getBoundingClientRect()
+        const edge = 48
+        let delta = 0
+        if (pointer.x < bounds.left + edge) {
+          delta = -Math.ceil((bounds.left + edge - pointer.x) / 4)
+        } else if (pointer.x > bounds.right - edge) {
+          delta = Math.ceil((pointer.x - (bounds.right - edge)) / 4)
+        }
+        if (delta) {
+          const before = scroller.scrollLeft
+          scroller.scrollLeft += delta
+          if (scroller.scrollLeft !== before) {
+            measure()
+            updatePosition(pointer.x, pointer.y)
+          }
+        }
+      }
+      scrollFrame = requestAnimationFrame(autoScroll)
+    }
+
     const onMove = ev => {
+      pointer = { x: ev.clientX, y: ev.clientY }
       const dx = ev.clientX - start.x, dy = ev.clientY - start.y
       if (!active) {
         if (isTouch) {
@@ -433,23 +768,30 @@ export default function Board({ boardId, onBack, online, share, onShared }) {
         if (!active) return
       }
       ev.preventDefault()
-      const { overCol, overIndex } = locate(ev.clientX, ev.clientY)
-      const d = dragRef.current
-      if (!d) return
-      Object.assign(d, { x: ev.clientX, y: ev.clientY, overCol, overIndex, moved: true })
-      setDrag({ ...d })
+      updatePosition(ev.clientX, ev.clientY)
     }
 
     const onUp = () => {
       const d = dragRef.current
+      let fullIndex = null
+      if (d && active && d.moved && d.overCol) {
+        const current = boardRef.current
+        const column = current?.columns.find(c => c.id === d.overCol)
+        const filters = filtersRef.current
+        const visibleIds = column?.cardIds.filter(id =>
+          cardMatchesFilters(current.cards[id], filters.text, filters.labels),
+        ) || []
+        fullIndex = visibleToFullIndex(column?.cardIds, visibleIds, d.overIndex, cardId)
+      }
       cleanup()
       if (d && active && d.moved && d.overCol) {
-        moveCard(cardId, d.overCol, d.overIndex)
+        moveCard(cardId, d.overCol, fullIndex)
       }
     }
 
     const cleanup = () => {
       clearTimeout(holdTimer)
+      if (scrollFrame !== null) cancelAnimationFrame(scrollFrame)
       window.removeEventListener('pointermove', onMove)
       window.removeEventListener('pointerup', onUp)
       window.removeEventListener('pointercancel', cleanup)
@@ -473,41 +815,117 @@ export default function Board({ boardId, onBack, online, share, onShared }) {
   if (!board) return <div className="kb-board" />
 
   const openCard_ = openCardId ? board.cards[openCardId] : null
-  const totalCards = Object.keys(board.cards).length
   const access = boardAccess(share, online)
+  const hasFilters = !!filterText.trim() || filterLabels.length > 0
 
   return (
     <>
-      <div className="kb-header">
-        <button className="kb-iconbtn kb-backbtn" aria-label="Back to boards" onClick={onBack}>
-          <ChevronLeft />
+      <div className="kb-header kb-board-header">
+        <button className="kb-iconbtn kb-homebtn" aria-label="All boards" onClick={onAllBoards}>
+          <Grid />
         </button>
-        <div className="kb-title-wrap">
-          <input
-            className="kb-title"
-            defaultValue={board.title}
-            key={`t-${board.title}`}
-            aria-label="Board name"
-            readOnly={!access.canWrite}
-            onBlur={e => { if (e.target.value.trim() && e.target.value !== board.title) renameBoard(e.target.value.trim()) }}
-            onKeyDown={e => { if (e.key === 'Enter') e.currentTarget.blur() }}
-          />
-          <div className="kb-sub">{totalCards === 1 ? '1 card' : `${totalCards} cards`}</div>
-        </div>
+        <BoardSwitcher
+          board={board}
+          boardId={boardId}
+          boards={boards}
+          shareMap={shareMap}
+          canWrite={access.canWrite}
+          open={switcherOpen}
+          onOpenChange={setSwitcherOpen}
+          onRename={renameBoard}
+          onSelect={onSwitchBoard}
+          onCreate={onCreateBoard}
+        />
+        <div className="kb-header-spacer" />
         {access.status && <span className="kb-offline">{access.status}</span>}
         {online && syncNote && <span className="kb-offline">{syncNote}</span>}
+        <button
+          className={`kb-iconbtn${hasFilters ? ' kb-filter-active' : ''}`}
+          aria-label="Filter cards"
+          aria-expanded={filtersOpen}
+          onClick={() => setFiltersOpen(open => !open)}
+        >
+          <Filter />
+        </button>
         <button className="kb-iconbtn" aria-label="Share board" onClick={() => setShareOpen(true)}>
           <Share />
         </button>
       </div>
       <div className="kb-divider" />
-      <div className="kb-board">
-        {board.columns.map(col => {
+      {filtersOpen && <div className="kb-filterbar" aria-label="Card filters">
+        <input
+          className="kb-input kb-filter-input"
+          type="search"
+          placeholder="Filter title or notes…"
+          aria-label="Filter cards by title or notes"
+          value={filterText}
+          onChange={event => setFilterText(event.target.value)}
+        />
+        <div className="kb-filter-labels" aria-label="Filter by label">
+          {Object.entries(LABELS).map(([name, color]) => {
+            const active = filterLabels.includes(name)
+            return <button
+              key={name}
+              className={`kb-filter-dot-btn${active ? ' kb-on' : ''}`}
+              aria-label={name === 'none' ? 'Filter unlabeled cards' : `Filter ${name} cards`}
+              aria-pressed={active}
+              onClick={() => setFilterLabels(labels =>
+                labels.includes(name) ? labels.filter(label => label !== name) : [...labels, name],
+              )}
+            >
+              <span
+                className={`kb-filter-dot${name === 'none' ? ' kb-none' : ''}`}
+                style={name === 'none' ? undefined : { background: color }}
+              />
+            </button>
+          })}
+        </div>
+      </div>}
+      <div className={`kb-board${animateColumns ? ' kb-board-enter' : ''}${board.columns.length === 0 ? ' kb-board-empty' : ''}`} ref={boardScrollRef}>
+        {board.columns.length === 0 && <div className="kb-empty-board-state">
+          <div className="kb-empty-board-title">No lists yet</div>
+          <div className="kb-empty">Add a list to start organizing this board.</div>
+          <button className="kb-btn kb-btn-primary" disabled={!access.canWrite} onClick={addColumn}>
+            <Plus /> Add list
+          </button>
+        </div>}
+        {board.columns.map((col, columnIndex) => {
           const showGap = drag && drag.moved && drag.overCol === col.id
-          const cards = col.cardIds.map(id => board.cards[id]).filter(Boolean)
+          const allCards = col.cardIds.map(id => board.cards[id]).filter(Boolean)
+          const cards = allCards.filter(card => cardMatchesFilters(card, filterText, filterLabels))
+          const cardNodes = []
+          let dropPosition = 0
+          for (const card of cards) {
+            if (showGap && card.id !== drag.cardId && drag.overIndex === dropPosition) {
+              cardNodes.push(<div key={`gap-${dropPosition}`} className="kb-gap" style={{ height: drag.h }} />)
+            }
+            cardNodes.push(<Card
+              key={card.id}
+              card={card}
+              lifted={drag?.cardId === card.id && drag.moved}
+              onOpen={openCard}
+              onDragStart={startDrag}
+              canWrite={access.canWrite}
+            />)
+            if (card.id !== drag?.cardId) dropPosition += 1
+          }
+          if (showGap && drag.overIndex >= dropPosition) {
+            cardNodes.push(<div key={`gap-${dropPosition}`} className="kb-gap" style={{ height: drag.h }} />)
+          }
           return (
-            <section key={col.id} data-col-id={col.id} className={`kb-col${showGap ? ' kb-drop' : ''}`} aria-label={col.name}>
+            <section
+              key={col.id}
+              data-col-id={col.id}
+              className={`kb-col${showGap ? ' kb-drop' : ''}`}
+              style={{ '--kb-col-index': columnIndex }}
+              aria-label={col.name}
+            >
               <div className="kb-col-head">
+                <span
+                  className="kb-col-status"
+                  style={{ background: col.color ? (LABELS[col.color] || 'var(--muted)') : 'var(--muted)' }}
+                  aria-hidden="true"
+                />
                 <input
                   className="kb-col-name"
                   defaultValue={col.name}
@@ -517,18 +935,39 @@ export default function Board({ boardId, onBack, online, share, onShared }) {
                   onBlur={e => { if (e.target.value.trim() && e.target.value !== col.name) renameColumn(col.id, e.target.value.trim()) }}
                   onKeyDown={e => { if (e.key === 'Enter') e.currentTarget.blur() }}
                 />
-                <span className="kb-count">{cards.length}</span>
-                {access.canWrite && <button
-                  className="kb-iconbtn"
+                <span className="kb-count">{hasFilters ? `${cards.length}/${allCards.length}` : allCards.length}</span>
+                <div className="kb-col-actions">
+                  <div className="kb-col-reorder" aria-label={`Reorder list ${col.name}`}>
+                  <button
+                    className="kb-iconbtn kb-col-action"
+                    aria-label={`Move list ${col.name} left`}
+                    disabled={!access.canWrite || columnIndex === 0}
+                    onClick={() => reorderColumn(col.id, -1)}
+                  >
+                    <ChevronLeft />
+                  </button>
+                  <button
+                    className="kb-iconbtn kb-col-action kb-chevron-right"
+                    aria-label={`Move list ${col.name} right`}
+                    disabled={!access.canWrite || columnIndex === board.columns.length - 1}
+                    onClick={() => reorderColumn(col.id, 1)}
+                  >
+                    <ChevronLeft />
+                  </button>
+                  </div>
+                  <button
+                  className="kb-iconbtn kb-col-action"
                   aria-label={`Delete list ${col.name}`}
-                  onClick={() => (cards.length ? setConfirmDeleteCol(col.id) : deleteColumn(col.id))}
+                  disabled={!access.canWrite}
+                  onClick={() => (allCards.length ? setConfirmDeleteCol(col.id) : deleteColumn(col.id))}
                 >
                   <Trash />
-                </button>}
+                  </button>
+                </div>
               </div>
               {access.canWrite && confirmDeleteCol === col.id && (
                 <div className="kb-composer" role="alertdialog" aria-label="Confirm delete">
-                  <div className="kb-empty">Delete “{col.name}” and its {cards.length} card{cards.length === 1 ? '' : 's'}?</div>
+                  <div className="kb-empty">Delete “{col.name}” and its {allCards.length} card{allCards.length === 1 ? '' : 's'}?</div>
                   <div className="kb-composer-row">
                     <button className="kb-btn kb-btn-primary" style={{ background: '#ef4444' }} onClick={() => deleteColumn(col.id)}>Delete</button>
                     <button className="kb-btn kb-btn-quiet" onClick={() => setConfirmDeleteCol(null)}>Cancel</button>
@@ -536,28 +975,9 @@ export default function Board({ boardId, onBack, online, share, onShared }) {
                 </div>
               )}
               <div className="kb-cards">
-                {cards.map((card, i) => {
-                  const els = []
-                  if (showGap && drag.overIndex === i && drag.cardId !== card.id) {
-                    els.push(<div key={`gap-${i}`} className="kb-gap" style={{ height: drag.h }} />)
-                  }
-                  els.push(
-                    <Card
-                      key={card.id}
-                      card={card}
-                      lifted={drag?.cardId === card.id && drag.moved}
-                      onOpen={openCard}
-                      onDragStart={startDrag}
-                      canWrite={access.canWrite}
-                    />,
-                  )
-                  return els
-                })}
-                {showGap && drag.overIndex >= cards.filter(c => c.id !== drag.cardId).length && (
-                  <div className="kb-gap" style={{ height: drag.h }} />
-                )}
+                {cardNodes}
                 {cards.length === 0 && !showGap && composerCol !== col.id && (
-                  <div className="kb-empty">Nothing here yet</div>
+                  <div className="kb-empty">{hasFilters && allCards.length ? 'No matching cards' : 'Nothing here yet'}</div>
                 )}
               </div>
               {access.canWrite && (composerCol === col.id ? (
@@ -570,7 +990,7 @@ export default function Board({ boardId, onBack, online, share, onShared }) {
             </section>
           )
         })}
-        {access.canWrite && <button className="kb-addcol" onClick={addColumn}><Plus /> Add list</button>}
+        {access.canWrite && board.columns.length > 0 && <button className="kb-addcol" onClick={addColumn}><Plus /> Add list</button>}
       </div>
 
       {drag?.moved && (
@@ -609,6 +1029,28 @@ export default function Board({ boardId, onBack, online, share, onShared }) {
               readOnly={!access.canWrite}
               onBlur={e => { if (e.target.value !== openCard_.notes) updateCard(openCard_.id, { notes: e.target.value }) }}
             />
+            <div>
+              <h3>Due date</h3>
+              <input
+                className="kb-input kb-date-input"
+                style={{ marginTop: 8 }}
+                type="date"
+                value={openCard_.due || ''}
+                aria-label="Card due date"
+                readOnly={!access.canWrite}
+                onChange={event => updateCard(openCard_.id, { due: event.target.value })}
+              />
+            </div>
+            <div>
+              <h3>Checklist</h3>
+              <ChecklistEditor
+                checklist={Array.isArray(openCard_.checklist) ? openCard_.checklist : []}
+                canWrite={access.canWrite}
+                onAdd={text => addCheckItem(openCard_.id, text)}
+                onToggle={itemId => toggleCheckItem(openCard_.id, itemId)}
+                onDelete={itemId => removeCheckItem(openCard_.id, itemId)}
+              />
+            </div>
             {access.canWrite && <div>
               <h3>Label</h3>
               <div className="kb-swatches" style={{ marginTop: 8 }}>
@@ -623,6 +1065,15 @@ export default function Board({ boardId, onBack, online, share, onShared }) {
                 ))}
               </div>
             </div>}
+            <div>
+              <h3>Assignee</h3>
+              <AssigneeEditor
+                card={openCard_}
+                canWrite={access.canWrite}
+                suggestions={share ? memberNames : []}
+                onUpdate={assignee => updateCard(openCard_.id, { assignee })}
+              />
+            </div>
             {access.canWrite && <div>
               <h3>Move to</h3>
               <div className="kb-chips" style={{ marginTop: 8 }}>

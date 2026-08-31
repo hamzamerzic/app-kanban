@@ -12,6 +12,8 @@
 //   the fields it knows about. A newer app version's extra fields survive a
 //   round-trip through an older app version.
 
+import { COLUMN_COLOR_KEYS, defaultColumnColor, isIsoDate } from './domain.js'
+
 export const SCHEMA_V = 1
 
 export const uid = () =>
@@ -26,9 +28,9 @@ export function newBoardDoc(title) {
     title: title || 'New board',
     createdAt: new Date().toISOString(),
     columns: [
-      { id: uid(), name: 'To do', cardIds: [] },
-      { id: uid(), name: 'In progress', cardIds: [] },
-      { id: uid(), name: 'Done', cardIds: [] },
+      { id: uid(), name: 'To do', color: null, cardIds: [] },
+      { id: uid(), name: 'In progress', color: 'blue', cardIds: [] },
+      { id: uid(), name: 'Done', color: 'green', cardIds: [] },
     ],
     cards: {},
   }
@@ -42,11 +44,55 @@ export function normalizeBoard(doc) {
   if (!Array.isArray(doc.columns)) doc.columns = []
   doc.columns = doc.columns.filter(col => col && typeof col === 'object' && !Array.isArray(col))
   if (!doc.cards || typeof doc.cards !== 'object' || Array.isArray(doc.cards)) doc.cards = {}
-  for (const col of doc.columns) {
+  doc.columns.forEach((col, index) => {
     if (!Array.isArray(col.cardIds)) col.cardIds = []
     if (typeof col.name !== 'string') col.name = 'List'
+    if (!Object.hasOwn(col, 'color')) col.color = defaultColumnColor(index)
+    else if (col.color !== null && !COLUMN_COLOR_KEYS.includes(col.color)) col.color = null
+  })
+  for (const [cardId, card] of Object.entries(doc.cards)) {
+    if (!card || typeof card !== 'object' || Array.isArray(card)) continue
+    if (!isIsoDate(card.due)) card.due = ''
+    if (typeof card.assignee !== 'string') card.assignee = ''
+    if (!Array.isArray(card.checklist)) card.checklist = []
+    card.checklist = card.checklist.filter(item => item && typeof item === 'object' && !Array.isArray(item))
+    card.checklist.forEach((item, index) => {
+      if (typeof item.id !== 'string' || !item.id) item.id = `${cardId}-check-${index}`
+      if (typeof item.text !== 'string') item.text = ''
+      item.done = item.done === true
+    })
   }
   return doc
+}
+
+export function normalizeUi(value) {
+  if (!value || typeof value !== 'object' || Array.isArray(value)) return { lastBoardId: null }
+  if (typeof value.lastBoardId !== 'string' || !value.lastBoardId) value.lastBoardId = null
+  return value
+}
+
+export async function loadUi() {
+  return normalizeUi(await store()?.get('ui.json'))
+}
+
+export async function saveLastBoardId(lastBoardId) {
+  const s = store()
+  if (!s) return null
+  for (let attempt = 0; attempt < 6; attempt++) {
+    const { value, version } = await s.getWithVersion('ui.json')
+    const next = structuredClone(normalizeUi(value))
+    next.lastBoardId = lastBoardId
+    try {
+      await s.durableWrite('ui.json', next, version
+        ? { ifMatch: version }
+        : { ifNoneMatch: true })
+      return next
+    } catch (error) {
+      if (error?.code === 'conflict') continue
+      throw error
+    }
+  }
+  throw new Error('Could not save the last-opened board after repeated conflicts.')
 }
 
 export const boardPath = id => `boards/${id}.json`
