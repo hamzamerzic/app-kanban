@@ -294,7 +294,7 @@ function ShareSheet({ board, boardId, share, onShared, onClose }) {
         {!share && (
           <>
             <h3>Share this board</h3>
-            <div className="kb-empty" style={{ textAlign: 'left', padding: 0 }}>
+            <div className="kb-empty kb-empty-left">
               Sharing keeps the board on your Möbius and lets people you invite
               edit it live from their own Möbius.
             </div>
@@ -308,15 +308,14 @@ function ShareSheet({ board, boardId, share, onShared, onClose }) {
             <div>
               <h3>Invite someone</h3>
               <input
-                className="kb-input"
-                style={{ marginTop: 8 }}
+                className="kb-input kb-field-spaced"
                 placeholder="@handle or handle@their-mobius-host"
                 value={handle}
                 onChange={e => setHandle(e.target.value)}
                 onKeyDown={e => { if (e.key === 'Enter') invite() }}
                 aria-label="Invite handle"
               />
-              <div className="kb-chips" style={{ marginTop: 8 }}>
+              <div className="kb-chips kb-field-spaced">
                 <button className={`kb-chip${role === 'editor' ? ' kb-on' : ''}`} onClick={() => setRole('editor')}>Can edit</button>
                 <button className={`kb-chip${role === 'viewer' ? ' kb-on' : ''}`} onClick={() => setRole('viewer')}>View only</button>
                 <button className="kb-btn kb-btn-primary" disabled={busy || !handle.trim()} onClick={invite}>Invite</button>
@@ -324,11 +323,11 @@ function ShareSheet({ board, boardId, share, onShared, onClose }) {
             </div>
             <div>
               <h3>People</h3>
-              <div style={{ marginTop: 8, display: 'flex', flexDirection: 'column', gap: 6 }}>
+              <div className="kb-people-list">
                 {members === null && <div className="kb-empty">Loading…</div>}
                 {members && Object.entries(members).map(([host, m]) => (
-                  <div key={host} className="kb-sheet-row" style={{ justifyContent: 'space-between' }}>
-                    <span style={{ fontSize: 13.5, overflowWrap: 'anywhere' }}>
+                  <div key={host} className="kb-sheet-row kb-sheet-row-between">
+                    <span className="kb-person-name">
                       {m.name || host}{' '}
                       <span className="kb-sub">
                         · {host === share.host ? 'you' : m.pending ? `invited · ${m.role}` : m.role}
@@ -348,13 +347,13 @@ function ShareSheet({ board, boardId, share, onShared, onClose }) {
         {share && !hosted && (
           <div>
             <h3>Shared board</h3>
-            <div className="kb-empty" style={{ textAlign: 'left' }}>
+            <div className="kb-empty kb-empty-left">
               This board lives on {share.host}. You joined as {share.role === 'viewer' ? 'a viewer' : 'an editor'}.
             </div>
           </div>
         )}
         {notice && (
-          <div className="kb-empty" style={{ color: notice.kind === 'error' ? '#ef4444' : notice.kind === 'warn' ? '#f59e0b' : '#10b981' }}>
+          <div className={`kb-notice kb-${notice.kind}`}>
             {notice.text}
           </div>
         )}
@@ -969,7 +968,7 @@ export default function Board({
                 <div className="kb-composer" role="alertdialog" aria-label="Confirm delete">
                   <div className="kb-empty">Delete “{col.name}” and its {allCards.length} card{allCards.length === 1 ? '' : 's'}?</div>
                   <div className="kb-composer-row">
-                    <button className="kb-btn kb-btn-primary" style={{ background: '#ef4444' }} onClick={() => deleteColumn(col.id)}>Delete</button>
+                    <button className="kb-btn kb-btn-danger" onClick={() => deleteColumn(col.id)}>Delete</button>
                     <button className="kb-btn kb-btn-quiet" onClick={() => setConfirmDeleteCol(null)}>Cancel</button>
                   </div>
                 </div>
@@ -1032,8 +1031,7 @@ export default function Board({
             <div>
               <h3>Due date</h3>
               <input
-                className="kb-input kb-date-input"
-                style={{ marginTop: 8 }}
+                className="kb-input kb-date-input kb-field-spaced"
                 type="date"
                 value={openCard_.due || ''}
                 aria-label="Card due date"
@@ -1053,7 +1051,7 @@ export default function Board({
             </div>
             {access.canWrite && <div>
               <h3>Label</h3>
-              <div className="kb-swatches" style={{ marginTop: 8 }}>
+              <div className="kb-swatches kb-field-spaced">
                 {Object.entries(LABELS).map(([name, color]) => (
                   <button
                     key={name}
@@ -1076,7 +1074,7 @@ export default function Board({
             </div>
             {access.canWrite && <div>
               <h3>Move to</h3>
-              <div className="kb-chips" style={{ marginTop: 8 }}>
+              <div className="kb-chips kb-field-spaced">
                 {board.columns.map(c => {
                   const here = c.cardIds.includes(openCard_.id)
                   return (
@@ -1092,7 +1090,7 @@ export default function Board({
                 })}
               </div>
             </div>}
-            <div className="kb-sheet-row" style={{ justifyContent: 'space-between' }}>
+            <div className="kb-sheet-row kb-sheet-row-between">
               {access.canWrite && <button className="kb-btn kb-btn-quiet kb-danger" onClick={() => deleteCard(openCard_.id)}>
                 Delete card
               </button>}

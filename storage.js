@@ -115,6 +115,10 @@ export async function listBoards() {
         title: doc.title,
         cardCount: Object.keys(doc.cards).length,
         columnCount: doc.columns.length,
+        columnPreview: doc.columns.slice(0, 5).map(column => ({
+          count: column.cardIds.length,
+          color: column.color,
+        })),
         createdAt: String(doc.createdAt || ''),
       })
     }
