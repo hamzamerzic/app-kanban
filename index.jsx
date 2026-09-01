@@ -13,6 +13,7 @@ export default function App({ appId, token }) {
   const [resolved, setResolved] = useState(false)
   const [online, setOnline] = useState(() => window.mobius?.online !== false)
   const navRef = useRef(null)
+  const openBoardIdRef = useRef(null)
   const readySignalled = useRef(false)
 
   configureSync(token)
@@ -52,6 +53,7 @@ export default function App({ appId, token }) {
           // This is intentionally plain state, not nav.open: system Back from
           // the launch board must leave the app rather than reveal home.
           setOpenId(ui.lastBoardId)
+          openBoardIdRef.current = ui.lastBoardId
           saveLastBoardId(ui.lastBoardId).catch(() => {})
         }
         listInvitations().then(setInvitations).catch(() => {})
@@ -73,6 +75,7 @@ export default function App({ appId, token }) {
   }, [refresh])
 
   const showBoard = useCallback(id => {
+    openBoardIdRef.current = id
     setOpenId(id)
     saveLastBoardId(id).catch(e => {
       window.mobius?.signal?.('error', { message: String(e?.message || e), source: 'save-ui' })
@@ -121,7 +124,10 @@ export default function App({ appId, token }) {
     let handle = null
     handle = nav.open('kanban-board', {
       onBack: () => { navRef.current = null; setOpenId(null); refresh() },
-      onForward: () => { navRef.current = handle; showBoard(id) },
+      onForward: () => {
+        navRef.current = handle
+        if (openBoardIdRef.current) showBoard(openBoardIdRef.current)
+      },
     })
     navRef.current = handle
     const { status } = await handle.outcome

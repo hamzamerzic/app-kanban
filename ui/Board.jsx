@@ -1,30 +1,29 @@
 import { useEffect, useRef, useState, useCallback } from 'react'
 import { Check, ChevronDown, ChevronLeft, Filter, Grid, Plus, Share, Trash } from '@openai/apps-sdk-ui/components/Icon'
 import { uid, subscribeBoard, getBoard, casMutate, boardPath, normalizeBoard } from '../storage.js'
-import { pullShared, pushSharedOp, inviteByHandle, getMembers, revokeMember, shareBoard } from '../sync.js'
+import { pullShared, pushSharedOp, inviteByHandle, getMembers, revokeMember, shareBoard, cacheSubscriptionIsAuthoritative, sharedCursorAfterWrite } from '../sync.js'
+import { applyBoardOp, cardMoveAnchor, columnMoveAnchor } from '../operations.js'
+import { applyPendingBoardOps, enqueuePendingBoardOp, readPendingBoardOps, replayPendingBoardOps } from '../pendingOps.js'
+import { useModalFocus } from './modalFocus.js'
 import {
-  addChecklistItem,
   assigneeAvatar,
   boardAccess,
   cardMatchesFilters,
   checklistProgress,
   defaultColumnColor,
-  deleteChecklistItem,
   dueDateStatus,
   formatDueDate,
-  swapColumns,
-  toggleChecklistItem,
   visibleToFullIndex,
 } from '../domain.js'
 
 export const LABELS = {
   none: 'transparent',
-  red: '#ef4444',
-  amber: '#f59e0b',
-  green: '#10b981',
-  blue: '#3b82f6',
-  purple: '#8b5cf6',
-  pink: '#ec4899',
+  red: 'var(--kb-label-red, #ef4444)',
+  amber: 'var(--kb-label-amber, #f59e0b)',
+  green: 'var(--kb-label-green, #10b981)',
+  blue: 'var(--kb-label-blue, #3b82f6)',
+  purple: 'var(--kb-label-purple, #8b5cf6)',
+  pink: 'var(--kb-label-pink, #ec4899)',
 }
 
 function Card({ card, lifted, onOpen, onDragStart, canWrite }) {
@@ -38,12 +37,17 @@ function Card({ card, lifted, onOpen, onDragStart, canWrite }) {
       data-card-id={card.id}
       role="button"
       tabIndex={0}
-      onClick={() => onOpen(card.id)}
+      onClick={event => { event.currentTarget.focus(); onOpen(card.id) }}
       onKeyDown={e => { if (e.key === 'Enter' || e.key === ' ') { e.preventDefault(); onOpen(card.id) } }}
       onPointerDown={canWrite ? e => onDragStart(e, card.id) : undefined}
     >
       {card.label && card.label !== 'none' && (
-        <div className="kb-label" style={{ background: LABELS[card.label] || LABELS.none }} />
+        <div
+          className="kb-label"
+          style={{ background: LABELS[card.label] || LABELS.none }}
+          role="img"
+          aria-label={`${card.label} label`}
+        />
       )}
       <div className="kb-card-title">{card.title}</div>
       {(dueStatus || progress.total > 0 || avatar) && <div className="kb-card-meta">
@@ -89,12 +93,7 @@ function memberDisplayNames(metadata) {
 }
 
 function BoardSwitcher({ board, boardId, boards, shareMap, canWrite, open, onOpenChange, onRename, onSelect, onCreate }) {
-  useEffect(() => {
-    if (!open) return undefined
-    const onKey = event => { if (event.key === 'Escape') onOpenChange(false) }
-    window.addEventListener('keydown', onKey)
-    return () => window.removeEventListener('keydown', onKey)
-  }, [open, onOpenChange])
+  const panelRef = useModalFocus(open, () => onOpenChange(false))
 
   const cardCount = Object.keys(board.cards).length
   const commitTitle = target => {
@@ -117,7 +116,7 @@ function BoardSwitcher({ board, boardId, boards, shareMap, canWrite, open, onOpe
       </button>
       {open && <>
         <div className="kb-scrim kb-switcher-scrim" onClick={() => onOpenChange(false)} />
-        <div className="kb-sheet kb-switcher-panel" role="dialog" aria-label="Switch boards">
+        <div ref={panelRef} tabIndex={-1} className="kb-sheet kb-switcher-panel" role="dialog" aria-modal="true" aria-label="Switch boards">
           <div className="kb-sheet-grab" />
           <input
             className="kb-input kb-switcher-title"
@@ -241,13 +240,14 @@ function ChecklistEditor({ checklist, canWrite, onAdd, onToggle, onDelete }) {
   )
 }
 
-function ShareSheet({ board, boardId, share, onShared, onClose }) {
+function ShareSheet({ boardId, share, onShared, onClose, beforeShare }) {
   const [handle, setHandle] = useState('')
   const [role, setRole] = useState('editor')
   const [members, setMembers] = useState(null)
   const [busy, setBusy] = useState(false)
   const [notice, setNotice] = useState(null) // {kind: 'ok'|'warn'|'error', text}
   const hosted = !!share?.hosted
+  const sheetRef = useModalFocus(true, onClose)
 
   useEffect(() => {
     if (hosted) {
@@ -258,7 +258,8 @@ function ShareSheet({ board, boardId, share, onShared, onClose }) {
   const start = async () => {
     setBusy(true); setNotice(null)
     try {
-      const entry = await shareBoard(boardId, board)
+      await beforeShare?.()
+      const entry = await shareBoard(boardId)
       onShared({ ...entry, hosted: true })
     } catch (e) {
       setNotice({ kind: 'error', text: String(e?.message || e) })
@@ -289,7 +290,7 @@ function ShareSheet({ board, boardId, share, onShared, onClose }) {
   return (
     <>
       <div className="kb-scrim" onClick={onClose} />
-      <div className="kb-sheet" role="dialog" aria-label="Share board">
+      <div ref={sheetRef} tabIndex={-1} className="kb-sheet" role="dialog" aria-modal="true" aria-label="Share board">
         <div className="kb-sheet-grab" />
         {!share && (
           <>
@@ -315,9 +316,9 @@ function ShareSheet({ board, boardId, share, onShared, onClose }) {
                 onKeyDown={e => { if (e.key === 'Enter') invite() }}
                 aria-label="Invite handle"
               />
-              <div className="kb-chips kb-field-spaced">
-                <button className={`kb-chip${role === 'editor' ? ' kb-on' : ''}`} onClick={() => setRole('editor')}>Can edit</button>
-                <button className={`kb-chip${role === 'viewer' ? ' kb-on' : ''}`} onClick={() => setRole('viewer')}>View only</button>
+              <div className="kb-chips kb-field-spaced" role="radiogroup" aria-label="Invitation role">
+                <button role="radio" aria-checked={role === 'editor'} className={`kb-chip${role === 'editor' ? ' kb-on' : ''}`} onClick={() => setRole('editor')}>Can edit</button>
+                <button role="radio" aria-checked={role === 'viewer'} className={`kb-chip${role === 'viewer' ? ' kb-on' : ''}`} onClick={() => setRole('viewer')}>View only</button>
                 <button className="kb-btn kb-btn-primary" disabled={busy || !handle.trim()} onClick={invite}>Invite</button>
               </div>
             </div>
@@ -420,6 +421,7 @@ export default function Board({
   const [switcherOpen, setSwitcherOpen] = useState(false)
   const [memberNames, setMemberNames] = useState([])
   const [animateColumns, setAnimateColumns] = useState(true)
+  const [queuedCount, setQueuedCount] = useState(0)
 
   const boardRef = useRef(null)
   const boardScrollRef = useRef(null)
@@ -431,6 +433,9 @@ export default function Board({
   const shareRef = useRef(share)
   const onlineRef = useRef(online)
   const filtersRef = useRef({ text: filterText, labels: filterLabels })
+  const replayingRef = useRef(false)
+  const cardSheetRef = useModalFocus(Boolean(openCardId), () => setOpenCardId(null))
+  const columnConfirmRef = useModalFocus(Boolean(confirmDeleteCol), () => setConfirmDeleteCol(null))
   boardRef.current = board
   shareRef.current = share
   onlineRef.current = online
@@ -462,12 +467,20 @@ export default function Board({
     let alive = true
     getBoard(boardId).then(doc => {
       if (!alive) return
-      if (doc) setBoard(doc)
+      if (doc) {
+        const initial = shareRef.current ? doc : applyPendingBoardOps(doc, boardId)
+        boardRef.current = initial
+        setBoard(initial)
+      }
+      setQueuedCount(readPendingBoardOps(boardId).length)
       unsub = subscribeBoard(boardId, v => {
         if (!v) return
+        if (!cacheSubscriptionIsAuthoritative(shareRef.current)) return
         if (pendingRef.current > 0) return
         if (dragRef.current) return
-        setBoard(v)
+        const next = applyPendingBoardOps(v, boardId)
+        boardRef.current = next
+        setBoard(next)
       })
     }).catch(err => {
       window.mobius?.signal?.('error', { message: String(err?.message || err), source: 'board-load' })
@@ -492,7 +505,10 @@ export default function Board({
         if (state.doc) {
           const normalized = normalizeBoard(state.doc)
           window.mobius?.storage?.set(boardPath(boardId), normalized).catch(() => {})
-          if (pendingRef.current === 0 && !dragRef.current) setBoard(normalized)
+          if (pendingRef.current === 0 && !dragRef.current) {
+            boardRef.current = normalized
+            setBoard(normalized)
+          }
         }
         if (!share.hosted && state.object) {
           const names = memberDisplayNames(state.object)
@@ -500,7 +516,7 @@ export default function Board({
         }
         setSyncNote('')
       } catch (e) {
-        setSyncNote('Sync unavailable — showing your last copy')
+        setSyncNote('Reconnecting — showing your last copy')
       } finally {
         pulling = false
       }
@@ -512,32 +528,76 @@ export default function Board({
     return () => { alive = false; clearInterval(t); document.removeEventListener('visibilitychange', onVis) }
   }, [share, boardId])
 
-  const mutate = useCallback(op => {
+  const mutate = useCallback((operation, onCommit) => {
     const entry = shareRef.current
     if (!boardAccess(entry, onlineRef.current).canWrite) return false
     const current = boardRef.current
     if (!current) return false
     const before = structuredClone(current)
-    const optimistic = op(structuredClone(current)) || current
+    const apply = base => applyBoardOp(base, operation)
+    const optimistic = apply(structuredClone(current)) || current
+
+    // Local-offline intent belongs to the app. Persist it synchronously before
+    // rendering it; if UI storage rejects the queue, report failure and leave
+    // the rendered board untouched.
+    const runtimeOnline = onlineRef.current && window.mobius?.online !== false
+    const alreadyQueued = !entry && readPendingBoardOps(boardId).length > 0
+    if (!entry && (!runtimeOnline || alreadyQueued)) {
+      try {
+        enqueuePendingBoardOp(boardId, operation)
+      } catch (error) {
+        window.mobius?.signal?.('error', { message: String(error?.message || error), source: 'offline-queue' })
+        setSyncNote('Offline change was not saved')
+        return false
+      }
+      boardRef.current = optimistic
+      setBoard(optimistic)
+      const count = readPendingBoardOps(boardId).length
+      setQueuedCount(count)
+      setSyncNote(`${count} change${count === 1 ? '' : 's'} waiting to reconnect`)
+      return true
+    }
+
     boardRef.current = optimistic
     setBoard(optimistic)
     pendingRef.current += 1
-    const onErr = e =>
+    const onErr = e => {
       window.mobius?.signal?.('error', { message: String(e?.message || e), source: 'save' })
+      if (entry) setSyncNote('Reconnecting — retrying the latest shared board')
+    }
     let settled = null
     writeChain.current = writeChain.current.catch(() => {}).then(async () => {
       if (entry) {
-        const landed = await pushSharedOp(entry, op, onErr)
+        const landed = await pushSharedOp(entry, apply, onErr)
         if (landed) {
-          versionRef.current = landed.version
+          versionRef.current = sharedCursorAfterWrite(landed)
           await window.mobius?.storage?.set(boardPath(boardId), landed.doc).catch(() => {})
           settled = landed.doc
+          onCommit?.()
         } else {
+          // A poll may have advanced while the optimistic write hid its doc.
+          // Resetting forces the next tick to fetch the full authority again.
+          versionRef.current = -1
           settled = before
         }
         return
       }
-      await casMutate(boardId, op, onErr)
+      const landed = await casMutate(boardId, apply, onErr)
+      if (landed) {
+        settled = landed
+        onCommit?.()
+        return
+      }
+      // The connection can disappear after the click but before durableWrite.
+      // Convert that unconfirmed attempt into our own replayable queue.
+      try {
+        enqueuePendingBoardOp(boardId, operation)
+        setQueuedCount(readPendingBoardOps(boardId).length)
+        setSyncNote('Change saved locally — reconnecting')
+      } catch (error) {
+        settled = before
+        window.mobius?.signal?.('error', { message: String(error?.message || error), source: 'offline-queue' })
+      }
     }).finally(() => {
       pendingRef.current -= 1
       if (pendingRef.current === 0) {
@@ -548,7 +608,11 @@ export default function Board({
           }
         } else {
           getBoard(boardId).then(v => {
-            if (v && pendingRef.current === 0 && !dragRef.current) setBoard(v)
+            if (v && pendingRef.current === 0 && !dragRef.current) {
+              const rendered = applyPendingBoardOps(v, boardId)
+              boardRef.current = rendered
+              setBoard(rendered)
+            }
           }).catch(() => {})
         }
       }
@@ -556,112 +620,116 @@ export default function Board({
     return true
   }, [boardId])
 
+  // Reconnect replay is serialized with ordinary writes and retains an op until
+  // CAS confirms it landed. The interval also retries transient reconnects
+  // without requiring another online/offline transition.
+  useEffect(() => {
+    if (share || !online) return undefined
+    let alive = true
+    const flush = () => {
+      if (!alive || replayingRef.current || readPendingBoardOps(boardId).length === 0) return
+      replayingRef.current = true
+      writeChain.current = writeChain.current.catch(() => {}).then(async () => {
+        const result = await replayPendingBoardOps(
+          boardId,
+          op => casMutate(boardId, base => applyBoardOp(base, op), error => {
+            window.mobius?.signal?.('error', { message: String(error?.message || error), source: 'offline-replay' })
+          }),
+          {
+            onLanded: (landed, remaining) => {
+              if (!alive || dragRef.current) return
+              const rendered = remaining.reduce(
+                (doc, entry) => applyBoardOp(doc, entry.op) || doc,
+                structuredClone(landed),
+              )
+              boardRef.current = rendered
+              setBoard(rendered)
+            },
+          },
+        )
+        if (!alive) return
+        setQueuedCount(result.pending)
+        setSyncNote(result.ok ? '' : `${result.pending} change${result.pending === 1 ? '' : 's'} could not sync — retrying`)
+      }).finally(() => { replayingRef.current = false })
+    }
+    flush()
+    const timer = setInterval(flush, 3000)
+    return () => { alive = false; clearInterval(timer) }
+  }, [boardId, online, share, queuedCount])
+
   const addCard = (colId, title) => {
     const id = uid()
     const createdAt = new Date().toISOString()
-    const queued = mutate(b => {
-      const col = b.columns.find(c => c.id === colId)
-      if (!col) return b
-      b.cards[id] = { id, title, notes: '', label: 'none', due: '', checklist: [], assignee: '', createdAt }
-      col.cardIds.push(id)
-      return b
-    })
-    if (queued) window.mobius?.signal?.('item_created', { type: 'card' })
+    mutate({
+      type: 'add-card',
+      columnId: colId,
+      card: { id, title, notes: '', label: 'none', due: '', checklist: [], assignee: '', createdAt },
+    }, () => window.mobius?.signal?.('item_created', { type: 'card' }))
   }
 
   const updateCard = (cardId, patch) => {
-    mutate(b => {
-      if (!b.cards[cardId]) return b
-      Object.assign(b.cards[cardId], patch)
-      return b
-    })
+    mutate({ type: 'update-card', cardId, patch })
   }
 
   const addCheckItem = (cardId, text) => {
     const item = { id: uid(), text, done: false }
-    mutate(b => {
-      const card = b.cards[cardId]
-      if (card) card.checklist = addChecklistItem(card.checklist, item)
-      return b
-    })
+    mutate({ type: 'add-checklist-item', cardId, item })
   }
 
   const toggleCheckItem = (cardId, itemId) => {
-    mutate(b => {
-      const card = b.cards[cardId]
-      if (card) card.checklist = toggleChecklistItem(card.checklist, itemId)
-      return b
-    })
+    const item = boardRef.current?.cards[cardId]?.checklist?.find(candidate => candidate.id === itemId)
+    if (item) mutate({ type: 'set-checklist-item', cardId, itemId, done: item.done !== true })
   }
 
   const removeCheckItem = (cardId, itemId) => {
-    mutate(b => {
-      const card = b.cards[cardId]
-      if (card) card.checklist = deleteChecklistItem(card.checklist, itemId)
-      return b
-    })
+    mutate({ type: 'delete-checklist-item', cardId, itemId })
   }
 
   const deleteCard = cardId => {
     setOpenCardId(null)
-    const queued = mutate(b => {
-      delete b.cards[cardId]
-      b.columns.forEach(c => { c.cardIds = c.cardIds.filter(x => x !== cardId) })
-      return b
-    })
-    if (queued) window.mobius?.signal?.('item_deleted')
+    mutate(
+      { type: 'delete-card', cardId },
+      () => window.mobius?.signal?.('item_deleted'),
+    )
   }
 
-  const moveCard = (cardId, toColId, toIndex) => {
-    mutate(b => {
-      const from = b.columns.find(c => c.cardIds.includes(cardId))
-      const to = b.columns.find(c => c.id === toColId)
-      if (!to || !b.cards[cardId]) return b
-      if (from) from.cardIds = from.cardIds.filter(x => x !== cardId)
-      const i = toIndex == null ? to.cardIds.length : Math.max(0, Math.min(toIndex, to.cardIds.length))
-      to.cardIds.splice(i, 0, cardId)
-      return b
-    })
+  const moveCard = (cardId, toColId, beforeCardId = null) => {
+    mutate({ type: 'move-card', cardId, toColumnId: toColId, beforeCardId })
+  }
+
+  const reorderCard = (cardId, offset) => {
+    const column = boardRef.current?.columns.find(item => item.cardIds.includes(cardId))
+    if (!column) return
+    const beforeCardId = cardMoveAnchor(column.cardIds, cardId, offset)
+    if (beforeCardId !== undefined) moveCard(cardId, column.id, beforeCardId)
   }
 
   const addColumn = () => {
     const id = uid()
-    mutate(b => {
-      b.columns.push({ id, name: 'New list', color: defaultColumnColor(b.columns.length), cardIds: [] })
-      return b
+    mutate({
+      type: 'add-column',
+      column: { id, name: 'New list', color: defaultColumnColor(boardRef.current?.columns.length || 0), cardIds: [] },
     })
   }
 
   const renameColumn = (colId, name) => {
-    mutate(b => {
-      const col = b.columns.find(c => c.id === colId)
-      if (col) col.name = name || col.name
-      return b
-    })
+    mutate({ type: 'rename-column', columnId: colId, name })
   }
 
   const deleteColumn = colId => {
     setConfirmDeleteCol(null)
-    mutate(b => {
-      const col = b.columns.find(c => c.id === colId)
-      if (!col) return b
-      col.cardIds.forEach(id => delete b.cards[id])
-      b.columns = b.columns.filter(c => c.id !== colId)
-      return b
-    })
+    mutate({ type: 'delete-column', columnId: colId })
   }
 
   const reorderColumn = (colId, offset) => {
-    mutate(b => {
-      b.columns = swapColumns(b.columns, colId, offset)
-      return b
-    })
+    const beforeColumnId = columnMoveAnchor(boardRef.current?.columns, colId, offset)
+    if (beforeColumnId !== undefined) mutate({ type: 'move-column', columnId: colId, beforeColumnId })
   }
 
   const renameBoard = title => {
     const next = title.trim()
     if (!next || next === boardRef.current?.title) return
-    if (mutate(b => { b.title = next; return b })) onBoardRenamed(boardId, next)
+    if (mutate({ type: 'rename-board', title: next })) onBoardRenamed(boardId, next)
   }
 
   // ---- drag & drop (pointer events; long-press on touch) ----
@@ -772,7 +840,7 @@ export default function Board({
 
     const onUp = () => {
       const d = dragRef.current
-      let fullIndex = null
+      let beforeCardId = null
       if (d && active && d.moved && d.overCol) {
         const current = boardRef.current
         const column = current?.columns.find(c => c.id === d.overCol)
@@ -780,11 +848,16 @@ export default function Board({
         const visibleIds = column?.cardIds.filter(id =>
           cardMatchesFilters(current.cards[id], filters.text, filters.labels),
         ) || []
-        fullIndex = visibleToFullIndex(column?.cardIds, visibleIds, d.overIndex, cardId)
+        const fullIndex = visibleToFullIndex(column?.cardIds, visibleIds, d.overIndex, cardId)
+        // Capture intent as an anchor on the rendered drop base. The op resolves
+        // that id again on its fresh CAS base and falls back to end-of-list if a
+        // collaborator removed it.
+        const withoutMoving = (column?.cardIds || []).filter(id => id !== cardId)
+        beforeCardId = withoutMoving[fullIndex] ?? null
       }
       cleanup()
       if (d && active && d.moved && d.overCol) {
-        moveCard(cardId, d.overCol, fullIndex)
+        moveCard(cardId, d.overCol, beforeCardId)
       }
     }
 
@@ -814,6 +887,8 @@ export default function Board({
   if (!board) return <div className="kb-board" />
 
   const openCard_ = openCardId ? board.cards[openCardId] : null
+  const openCardColumn = openCard_ ? board.columns.find(column => column.cardIds.includes(openCard_.id)) : null
+  const openCardIndex = openCardColumn ? openCardColumn.cardIds.indexOf(openCard_.id) : -1
   const access = boardAccess(share, online)
   const hasFilters = !!filterText.trim() || filterLabels.length > 0
 
@@ -836,8 +911,10 @@ export default function Board({
           onCreate={onCreateBoard}
         />
         <div className="kb-header-spacer" />
-        {access.status && <span className="kb-offline">{access.status}</span>}
-        {online && syncNote && <span className="kb-offline">{syncNote}</span>}
+        {(queuedCount > 0 || access.status) && <span className="kb-offline">
+          {queuedCount > 0 ? `${queuedCount} change${queuedCount === 1 ? '' : 's'} pending` : access.status}
+        </span>}
+        {syncNote && <span className="kb-offline">{syncNote}</span>}
         <button
           className={`kb-iconbtn${hasFilters ? ' kb-filter-active' : ''}`}
           aria-label="Filter cards"
@@ -965,7 +1042,7 @@ export default function Board({
                 </div>
               </div>
               {access.canWrite && confirmDeleteCol === col.id && (
-                <div className="kb-composer" role="alertdialog" aria-label="Confirm delete">
+                <div ref={columnConfirmRef} tabIndex={-1} className="kb-composer" role="alertdialog" aria-modal="true" aria-label="Confirm delete">
                   <div className="kb-empty">Delete “{col.name}” and its {allCards.length} card{allCards.length === 1 ? '' : 's'}?</div>
                   <div className="kb-composer-row">
                     <button className="kb-btn kb-btn-danger" onClick={() => deleteColumn(col.id)}>Delete</button>
@@ -1007,7 +1084,7 @@ export default function Board({
       {openCard_ && (
         <>
           <div className="kb-scrim" onClick={() => setOpenCardId(null)} />
-          <div className="kb-sheet" role="dialog" aria-label="Card details">
+          <div ref={cardSheetRef} tabIndex={-1} className="kb-sheet" role="dialog" aria-modal="true" aria-label="Card details">
             <div className="kb-sheet-grab" />
             <textarea
               className="kb-input"
@@ -1072,6 +1149,27 @@ export default function Board({
                 onUpdate={assignee => updateCard(openCard_.id, { assignee })}
               />
             </div>
+            {access.canWrite && openCardColumn && <div>
+              <h3>Position</h3>
+              <div className="kb-position-actions kb-field-spaced">
+                <button
+                  className="kb-btn kb-btn-quiet"
+                  disabled={openCardIndex <= 0}
+                  onClick={() => reorderCard(openCard_.id, -1)}
+                >
+                  <span className="kb-position-up" aria-hidden="true"><ChevronDown /></span>
+                  Move up
+                </button>
+                <button
+                  className="kb-btn kb-btn-quiet"
+                  disabled={openCardIndex < 0 || openCardIndex >= openCardColumn.cardIds.length - 1}
+                  onClick={() => reorderCard(openCard_.id, 1)}
+                >
+                  <ChevronDown aria-hidden="true" />
+                  Move down
+                </button>
+              </div>
+            </div>}
             {access.canWrite && <div>
               <h3>Move to</h3>
               <div className="kb-chips kb-field-spaced">
@@ -1102,10 +1200,14 @@ export default function Board({
 
       {shareOpen && (
         <ShareSheet
-          board={board}
           boardId={boardId}
           share={share}
           onShared={onShared}
+          beforeShare={async () => {
+            await writeChain.current.catch(() => {})
+            const pending = readPendingBoardOps(boardId).length
+            if (pending) throw new Error(`Reconnect before sharing so ${pending} pending change${pending === 1 ? '' : 's'} can sync.`)
+          }}
           onClose={() => setShareOpen(false)}
         />
       )}

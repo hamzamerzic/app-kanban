@@ -83,6 +83,40 @@ test('ui storage remembers the last board with conflict-safe additive writes', a
   })
 })
 
+test('last-board persistence is serialized and the last requested id wins', async () => {
+  let stored = { lastBoardId: 'old', future: 'kept' }
+  let version = 1
+  let releaseFirst
+  let firstStarted
+  const started = new Promise(resolve => { firstStarted = resolve })
+  const gate = new Promise(resolve => { releaseFirst = resolve })
+  let writes = 0
+  let inFlight = 0
+  let maxInFlight = 0
+  globalThis.window = { mobius: { storage: {
+    async getWithVersion() { return { value: structuredClone(stored), version: `u${version}` } },
+    async durableWrite(_path, value, options) {
+      writes += 1
+      inFlight += 1
+      maxInFlight = Math.max(maxInFlight, inFlight)
+      if (writes === 1) { firstStarted(); await gate }
+      assert.equal(options.ifMatch, `u${version}`)
+      stored = structuredClone(value)
+      version += 1
+      inFlight -= 1
+    },
+  } } }
+
+  const first = saveLastBoardId('board-a')
+  await started
+  const second = saveLastBoardId('board-b')
+  releaseFirst()
+  await Promise.all([first, second])
+  assert.equal(maxInFlight, 1)
+  assert.equal(stored.lastBoardId, 'board-b')
+  assert.equal(stored.future, 'kept')
+})
+
 test('CAS mutation reapplies an operation to the freshest board after conflict', async () => {
   const reads = [
     { value: { v: 1, title: 'stale', columns: [], cards: {} }, version: 'v1' },
@@ -117,6 +151,18 @@ test('CAS mutation never resurrects a deleted board', async () => {
   assert.equal(writes, 0)
 })
 
+test('CAS mutation does not report a runtime-queued conditional write as landed', async () => {
+  let error = null
+  globalThis.window = { mobius: { storage: {
+    async getWithVersion() {
+      return { value: { v: 1, title: 'Board', columns: [], cards: {} }, version: 'v1' }
+    },
+    async durableWrite() { return { queued: true } },
+  } } }
+  assert.equal(await casMutate('b1', board => board, value => { error = value }), null)
+  assert.equal(error?.code, 'queued')
+})
+
 test('first-run seed treats a competing creator as success', async () => {
   globalThis.window = { mobius: { storage: {
     async durableWrite(path, value, options) {
@@ -131,13 +177,16 @@ test('first-run seed treats a competing creator as success', async () => {
 
 test('legacy migration keeps a deterministic id and removes the old path only after save', async () => {
   const calls = []
+  let destination = null
   globalThis.window = { mobius: { storage: {
     async get(path) {
       calls.push(['get', path])
-      return { title: 'Legacy', columns: [], cards: {}, future: 'kept' }
+      if (path === 'board.json') return { title: 'Legacy', columns: [], cards: {}, future: 'kept' }
+      return structuredClone(destination)
     },
     async durableWrite(path, value, options) {
       calls.push(['write', path, structuredClone(value), options])
+      destination = structuredClone(value)
     },
     async remove(path) { calls.push(['remove', path]) },
   } } }
@@ -146,4 +195,26 @@ test('legacy migration keeps a deterministic id and removes the old path only af
   assert.equal(calls[1][2].future, 'kept')
   assert.deepEqual(calls[1][3], { ifNoneMatch: true })
   assert.deepEqual(calls.at(-1), ['remove', 'board.json'])
+})
+
+test('legacy migration retains its source and signals when a destination conflict is unrelated', async () => {
+  const removed = []
+  const signals = []
+  globalThis.window = { mobius: {
+    signal(type, detail) { signals.push({ type, detail }) },
+    storage: {
+      async get(path) {
+        if (path === 'board.json') {
+          return { id: 'collision', title: 'Legacy', createdAt: '2020-01-01T00:00:00.000Z', columns: [], cards: {} }
+        }
+        return { id: 'collision', title: 'Someone else', createdAt: '2021-01-01T00:00:00.000Z', columns: [], cards: {} }
+      },
+      async durableWrite() { throw Object.assign(new Error('exists'), { code: 'conflict' }) },
+      async remove(path) { removed.push(path) },
+    },
+  } }
+  await migrateLegacy()
+  assert.deepEqual(removed, [])
+  assert.equal(signals[0]?.type, 'error')
+  assert.equal(signals[0]?.detail.source, 'legacy-migration')
 })

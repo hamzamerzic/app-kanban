@@ -19,17 +19,17 @@ import {
   visibleToFullIndex,
 } from '../domain.js'
 
-test('local boards remain writable offline because storage queues their writes', () => {
+test('local boards remain writable offline because the app owns their pending operations', () => {
   assert.deepEqual(boardAccess(null, false), {
     canWrite: true,
-    status: 'Offline — changes will sync',
+    status: 'Offline — changes will wait to sync',
   })
 })
 
 test('shared boards become read-only while offline instead of promising lost writes', () => {
   assert.deepEqual(boardAccess({ role: 'editor' }, false), {
     canWrite: false,
-    status: 'Offline — shared board is read-only',
+    status: 'Reconnecting — shared board is read-only',
   })
 })
 

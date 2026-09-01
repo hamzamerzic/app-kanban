@@ -2,13 +2,13 @@ export function boardAccess(share, online) {
   if (!share) {
     return {
       canWrite: true,
-      status: online ? '' : 'Offline — changes will sync',
+      status: online ? '' : 'Offline — changes will wait to sync',
     }
   }
   if (!online) {
     return {
       canWrite: false,
-      status: 'Offline — shared board is read-only',
+      status: 'Reconnecting — shared board is read-only',
     }
   }
   if (share.role === 'viewer') {

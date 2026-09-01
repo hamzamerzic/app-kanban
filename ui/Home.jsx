@@ -1,11 +1,13 @@
 import { useState } from 'react'
 import { Plus, Trash } from '@openai/apps-sdk-ui/components/Icon'
 import { invitationKey } from '../domain.js'
+import { useModalFocus } from './modalFocus.js'
 
 export default function Home({ boards, shareMap = {}, invitations = [], online, onOpen, onCreate, onDelete, onAccept, onDecline }) {
   const [confirmId, setConfirmId] = useState(null)
   const [invError, setInvError] = useState(null)
   const [busyInv, setBusyInv] = useState(null)
+  const confirmRef = useModalFocus(Boolean(confirmId), () => setConfirmId(null))
 
   return (
     <>
@@ -22,7 +24,7 @@ export default function Home({ boards, shareMap = {}, invitations = [], online, 
           const preview = Array.isArray(b.columnPreview) ? b.columnPreview.slice(0, 5) : []
           const maxCards = Math.max(1, ...preview.map(column => column.count))
           return <div key={b.id} className="kb-board-tile">
-            {confirmId === b.id ? <div className="kb-tile kb-tile-confirm" role="alertdialog" aria-label={`Delete board ${b.title}?`}>
+            {confirmId === b.id ? <div ref={confirmRef} tabIndex={-1} className="kb-tile kb-tile-confirm" role="alertdialog" aria-modal="true" aria-label={`Delete board ${b.title}?`}>
               <div className="kb-confirm-copy">Delete “{b.title}”?</div>
               <div className="kb-composer-row">
                 <button className="kb-btn kb-btn-danger kb-btn-compact" onClick={() => { setConfirmId(null); onDelete(b.id) }}>Delete</button>
