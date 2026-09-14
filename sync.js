@@ -9,7 +9,7 @@
 
 import { normalizeBoard, boardPath, getBoard } from './storage.js'
 
-const API = '/api/common/objects'
+const API = '/api/services/common/objects'
 const store = () => window.mobius?.storage
 
 let _auth = null
@@ -146,8 +146,45 @@ export async function getMembers(oid) {
   return _json(await fetch(`${API}/${oid}/members`, { headers: _auth }))
 }
 
-export async function revokeMember(oid, host) {
-  return _json(await fetch(`${API}/${oid}/members/${encodeURIComponent(host)}`, {
+// Older servers return one host; account-aware servers return per-deployment
+// delivery results. Keep the result honest during independently timed upgrades.
+export function inviteDeliveryNotice(result) {
+  const deliveries = result.recipients || [{ host: result.host, delivery: result.delivery }]
+  const delivered = deliveries.filter(item => item.delivery === 'delivered').length
+  if (delivered === deliveries.length) {
+    return { kind: 'ok', text: deliveries.length > 1
+      ? `Invitation delivered to all ${deliveries.length} linked deployments.`
+      : 'Invitation delivered — it is waiting on their Möbius.' }
+  }
+  return { kind: 'warn', text: delivered
+    ? `Invitation delivered to ${delivered} of ${deliveries.length} deployments. Some could not be reached. Send again to retry delivery.`
+    : 'Access is ready, but the invitation could not be delivered. Send again when their Möbius is reachable.' }
+}
+
+export function groupCollaborators(members) {
+  const groups = new Map()
+  for (const member of members) {
+    // Never group by handle: unverified peers can use identical display names.
+    const key = member.collaborator_id || member.host || member
+    const existing = groups.get(key)
+    if (!existing) {
+      groups.set(key, { ...member, hosts: [member.host] })
+    } else {
+      existing.hosts.push(member.host)
+      existing.pending = existing.pending && member.pending
+      existing.active = existing.active || member.active
+    }
+  }
+  return [...groups.values()]
+}
+
+export function collaboratorForHost(members, host) {
+  return members.find(member => member.host === host || member.hosts?.includes(host))
+}
+
+export async function revokeCollaborator(oid, member) {
+  const scope = member.collaborator_id ? '?all_deployments=true' : ''
+  return _json(await fetch(`${API}/${oid}/members/${encodeURIComponent(member.host)}${scope}`, {
     method: 'DELETE',
     headers: _auth,
   }))
@@ -170,12 +207,40 @@ export async function leaveBoard(boardId, entry) {
 
 // ---- sync engine
 
-export async function pullShared(entry, sinceVersion) {
-  const res = await _json(await fetch(
+export async function pullShared(entry, sinceVersion, request = fetch) {
+  const res = await _json(await request(
     `${API}/${encodeURIComponent(entry.host)}/${entry.oid}/state?since_version=${sinceVersion}`,
     { headers: _auth },
   ))
   return res // {status, version, doc?, object?}
+}
+
+export async function putSharedAsset(entry, assetId, mime, data, request = fetch) {
+  return _json(await request(
+    `${API}/${encodeURIComponent(entry.host)}/${entry.oid}/assets/${encodeURIComponent(assetId)}`,
+    { method: 'PUT', headers: _auth, body: JSON.stringify({ mime, data }) },
+  ))
+}
+
+export async function getSharedAsset(entry, assetId, request = fetch) {
+  const result = await _json(await request(
+    `${API}/${encodeURIComponent(entry.host)}/${entry.oid}/assets/${encodeURIComponent(assetId)}`,
+    { headers: _auth },
+  ))
+  return result.asset
+}
+
+export async function deleteSharedAsset(entry, assetId, request = fetch) {
+  return _json(await request(
+    `${API}/${encodeURIComponent(entry.host)}/${entry.oid}/assets/${encodeURIComponent(assetId)}`,
+    { method: 'DELETE', headers: _auth },
+  ))
+}
+
+// A board the owner is actively using should feel collaborative; an idle one
+// can relax to the former cadence without creating a permanent fast poll.
+export function sharedBoardPollDelay(lastInteractionAt, now = Date.now()) {
+  return now - lastInteractionAt < 15_000 ? 1000 : 3000
 }
 
 // A shared object's poll is its only authority. The app-storage document is an
@@ -190,14 +255,14 @@ export function sharedCursorAfterWrite(landed) {
 }
 
 // Apply `op` to the shared doc with CAS retry. Returns the doc that landed.
-export async function pushSharedOp(entry, op, onError) {
+export async function pushSharedOp(entry, op, onError, request = fetch) {
   for (let attempt = 0; attempt < 6; attempt++) {
     try {
-      const state = await pullShared(entry, -1)
+      const state = await pullShared(entry, -1, request)
       const base = normalizeBoard(state.doc)
       if (!base) return null
       const next = op(structuredClone(base)) || base
-      const res = await _json(await fetch(
+      const res = await _json(await request(
         `${API}/${encodeURIComponent(entry.host)}/${entry.oid}/state`,
         {
           method: 'PUT',

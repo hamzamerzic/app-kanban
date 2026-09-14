@@ -11,6 +11,8 @@ export default function App({ appId, token }) {
   const [invitations, setInvitations] = useState([])
   const [openId, setOpenId] = useState(null)
   const [resolved, setResolved] = useState(false)
+  const [loadError, setLoadError] = useState(false)
+  const [loadAttempt, setLoadAttempt] = useState(0)
   const [online, setOnline] = useState(() => window.mobius?.online !== false)
   const navRef = useRef(null)
   const openBoardIdRef = useRef(null)
@@ -18,29 +20,41 @@ export default function App({ appId, token }) {
 
   configureSync(token)
 
+  const refreshInvitations = useCallback(async () => {
+    try {
+      const next = await listInvitations()
+      setInvitations(next)
+      return next
+    } catch {
+      // Invitations are additive UI: a temporary federation failure must not
+      // disturb local boards or erase an invitation already on screen.
+      return null
+    }
+  }, [])
+
   const refresh = useCallback(async () => {
     try {
       const [b, map] = await Promise.all([listBoards(), loadShareMap()])
       setBoards(b)
+      setLoadError(false)
       setShareMap(map)
-      // Invitations are additive UI: their fetch failing must not blank boards.
-      listInvitations().then(setInvitations).catch(() => {})
+      refreshInvitations()
       if (!readySignalled.current) {
         readySignalled.current = true
         window.mobius?.signal?.('app_ready', { item_count: b.length })
       }
       return b
     } catch (e) {
-      setBoards([])
+      setLoadError(true)
       window.mobius?.signal?.('error', { message: String(e?.message || e), source: 'list' })
       return null
     }
-  }, [])
+  }, [refreshInvitations])
 
   useEffect(() => {
     ;(async () => {
-      await migrateLegacy()
       try {
+        await migrateLegacy()
         let [b, map, ui] = await Promise.all([listBoards(), loadShareMap(), loadUi()])
         // First run: seed one board so the app is immediately useful.
         if (b.length === 0) {
@@ -48,6 +62,7 @@ export default function App({ appId, token }) {
           b = await listBoards()
         }
         setBoards(b)
+        setLoadError(false)
         setShareMap(map)
         if (ui.lastBoardId && b.some(board => board.id === ui.lastBoardId)) {
           // This is intentionally plain state, not nav.open: system Back from
@@ -56,13 +71,13 @@ export default function App({ appId, token }) {
           openBoardIdRef.current = ui.lastBoardId
           saveLastBoardId(ui.lastBoardId).catch(() => {})
         }
-        listInvitations().then(setInvitations).catch(() => {})
+        refreshInvitations()
         if (!readySignalled.current) {
           readySignalled.current = true
           window.mobius?.signal?.('app_ready', { item_count: b.length })
         }
       } catch (e) {
-        setBoards([])
+        setLoadError(true)
         window.mobius?.signal?.('error', { message: String(e?.message || e), source: 'initial-load' })
       } finally {
         // The loading root remains the only rendered view until the launch
@@ -72,7 +87,19 @@ export default function App({ appId, token }) {
     })()
     const t = setInterval(() => setOnline(window.mobius?.online !== false), 3000)
     return () => clearInterval(t)
-  }, [refresh])
+  }, [refresh, refreshInvitations, loadAttempt])
+
+  useEffect(() => {
+    const check = () => {
+      if (!document.hidden && window.mobius?.online !== false) refreshInvitations()
+    }
+    const timer = setInterval(check, 3000)
+    document.addEventListener('visibilitychange', check)
+    return () => {
+      clearInterval(timer)
+      document.removeEventListener('visibilitychange', check)
+    }
+  }, [refreshInvitations])
 
   const showBoard = useCallback(id => {
     openBoardIdRef.current = id
@@ -202,6 +229,15 @@ export default function App({ appId, token }) {
   return (
     <div className="kb-root">
       <style>{CSS}</style>
+      {resolved && loadError && <section className="kb-load-error" role="alert">
+        <h2>Boards couldn’t be loaded</h2>
+        <p>{boards ? 'Your last loaded boards are still here. Try refreshing the list.' : 'We couldn’t read your boards. Try again to load them.'}</p>
+        <button className="kb-btn kb-btn-primary" onClick={() => {
+          setLoadError(false)
+          if (boards === null) { setResolved(false); setLoadAttempt(attempt => attempt + 1) }
+          else refresh()
+        }}>Try again</button>
+      </section>}
       {!resolved ? null : openId ? (
         <Board
           key={openId}

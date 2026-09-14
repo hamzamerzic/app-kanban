@@ -1,11 +1,11 @@
 {
   "id": "kanban",
   "name": "Kanban",
-  "version": "0.5.0",
+  "version": "0.5.3",
   "description": "Kanban boards that open where you left off: drag-and-drop lists, due dates and assignees, and live collaboration with people on their own Möbius.",
-  "author": "hamzamerzic",
+  "author": "mobius-os",
   "license": "MIT",
-  "homepage": "https://github.com/hamzamerzic/app-kanban",
+  "homepage": "https://github.com/mobius-os/app-kanban",
   "entry": "index.jsx",
   "icon": "icon.png",
   "offline_capable": true,
@@ -27,15 +27,20 @@
     "execution": "full"
   },
   "source_files": [
+    "boardRepository.js",
+    "attachments.js",
     "domain.js",
     "operations.js",
     "pendingOps.js",
     "storage.js",
     "sync.js",
     "theme.js",
+    "ui/focusableElements.js",
     "ui/modalFocus.js",
     "ui/Home.jsx",
-    "ui/Board.jsx"
+    "ui/Board.jsx",
+    "scripts/kanban.mjs",
+    "kanban-agent.md"
   ],
   "store": {
     "tagline": "Boards that open where you left off — and that your friends can join.",
@@ -52,5 +57,8 @@
         "label": "Room to think on the desktop"
       }
     ]
-  }
+  },
+  "skills": [
+    "kanban-agent.md"
+  ]
 }

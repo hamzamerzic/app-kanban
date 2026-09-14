@@ -1,4 +1,5 @@
-// Data layer for Kanban boards.
+// Low-level private-board storage and offline copies.
+// Use boardRepository.js for authoritative reads/writes: shared boards live elsewhere.
 //
 // Layout: one document per board at `boards/<id>.json`. No shared index file —
 // the board list is enumerated with storage.list(), so creating or deleting a
@@ -55,6 +56,14 @@ export function normalizeBoard(doc) {
     if (!isIsoDate(card.due)) card.due = ''
     if (typeof card.assignee !== 'string') card.assignee = ''
     if (typeof card.assigneeHost !== 'string') card.assigneeHost = ''
+    // Images were the first attachment type. Migrate that field into the
+    // general attachment collection without losing existing card media.
+    if (!Array.isArray(card.attachments)) {
+      card.attachments = Array.isArray(card.images) ? card.images : []
+    }
+    card.attachments = card.attachments.filter(attachment => attachment && typeof attachment === 'object'
+      && typeof attachment.id === 'string' && attachment.id)
+    delete card.images
     if (!Array.isArray(card.checklist)) card.checklist = []
     card.checklist = card.checklist.filter(item => item && typeof item === 'object' && !Array.isArray(item))
     card.checklist.forEach((item, index) => {
@@ -165,8 +174,7 @@ export async function getBoard(id) {
 // in place (or returns a replacement) and must only touch fields it owns.
 // A missing document aborts the write: mutating a deleted board must never
 // resurrect it.
-export async function casMutate(id, op, onError) {
-  const s = store()
+export async function casMutate(id, op, onError, s = store()) {
   if (!s) return null
   for (let attempt = 0; attempt < 6; attempt++) {
     try {
