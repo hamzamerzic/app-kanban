@@ -11,12 +11,18 @@ import {
 } from '../pendingOps.js'
 import { casMutate } from '../storage.js'
 import { cacheSubscriptionIsAuthoritative, sharedCursorAfterWrite } from '../sync.js'
+import { createBoardRepository, replayOutcomeForBoardError } from '../boardRepository.js'
 
 function memoryStorage() {
   const values = new Map()
   return {
-    getItem: key => values.get(key) ?? null,
-    setItem: (key, value) => { values.set(key, String(value)) },
+    async list(prefix) {
+      return [...values.entries()]
+        .filter(([path]) => path.startsWith(prefix))
+        .map(([path, content]) => ({ path, name: path.split('/').at(-1), content: structuredClone(content) }))
+    },
+    async set(path, value) { values.set(path, structuredClone(value)) },
+    async remove(path) { values.delete(path) },
   }
 }
 
@@ -33,14 +39,34 @@ const boardDoc = () => ({
 
 test.afterEach(() => { delete globalThis.window })
 
+test('the former browser queue migrates into per-operation app storage without losing intent', async () => {
+  const appStorage = memoryStorage()
+  const legacyValues = new Map([[
+    'kanban:pending-board-ops:v1:board',
+    JSON.stringify([{ id: 'legacy-1', op: { type: 'rename-board', title: 'Recovered' } }]),
+  ]])
+  globalThis.window = {
+    localStorage: {
+      getItem: key => legacyValues.get(key) ?? null,
+      removeItem: key => legacyValues.delete(key),
+    },
+  }
+
+  const migrated = await readPendingBoardOps('board', appStorage)
+  assert.deepEqual(migrated, [
+    { id: 'legacy-1', op: { type: 'rename-board', title: 'Recovered' } },
+  ])
+  assert.equal(legacyValues.has('kanban:pending-board-ops:v1:board'), false)
+})
+
 test('offline reconnect conflict rebases every queued operation or retains an explicit failure', async () => {
   const uiStorage = memoryStorage()
-  enqueuePendingBoardOp('board', {
+  await enqueuePendingBoardOp('board', {
     type: 'add-card',
     columnId: 'todo',
     card: { id: 'b', title: 'B', notes: '', label: 'none', due: '', checklist: [], assignee: '' },
   }, uiStorage)
-  enqueuePendingBoardOp('board', {
+  await enqueuePendingBoardOp('board', {
     type: 'update-card', cardId: 'a', patch: { title: 'A edited offline' },
   }, uiStorage)
 
@@ -68,15 +94,52 @@ test('offline reconnect conflict rebases every queued operation or retains an ex
 
   const result = await replayPendingBoardOps(
     'board',
-    op => casMutate('board', doc => applyBoardOp(doc, op)),
+    async op => ({ status: 'landed', doc: await casMutate('board', doc => applyBoardOp(doc, op)) }),
     { storage: uiStorage },
   )
   assert.equal(result.ok, true)
-  assert.deepEqual(readPendingBoardOps('board', uiStorage), [])
+  assert.deepEqual(await readPendingBoardOps('board', uiStorage), [])
   assert.equal(server.cards.a.title, 'A edited offline')
   assert.equal(server.cards.b.title, 'B')
   assert.equal(server.cards.concurrent.title, 'Concurrent')
   assert.deepEqual(server.columns[0].cardIds, ['concurrent', 'a', 'b'])
+})
+
+test('terminal queued operations are discarded without blocking later changes', async () => {
+  const uiStorage = memoryStorage()
+  await enqueuePendingBoardOp('board', { type: 'update-card', cardId: 'gone', patch: { title: 'Gone' } }, uiStorage)
+  await enqueuePendingBoardOp('board', { type: 'update-card', cardId: 'a', patch: { title: 'Landed' } }, uiStorage)
+  const discarded = []
+  const result = await replayPendingBoardOps('board', async op => {
+    if (op.cardId === 'gone') return { status: 'discarded', error: new Error('Card no longer exists.') }
+    const doc = boardDoc()
+    applyBoardOp(doc, op)
+    return { status: 'landed', doc }
+  }, { storage: uiStorage, onDiscarded: error => discarded.push(error.message) })
+  assert.equal(result.ok, true)
+  assert.equal(result.discarded, 1)
+  assert.deepEqual(discarded, ['Card no longer exists.'])
+  assert.equal(result.doc.cards.a.title, 'Landed')
+  assert.deepEqual(await readPendingBoardOps('board', uiStorage), [])
+})
+
+test('malformed authority metadata retains durable queued intent for repair', async () => {
+  const queueStorage = memoryStorage()
+  const op = { type: 'update-card', cardId: 'a', patch: { title: 'Keep me' } }
+  await enqueuePendingBoardOp('board', op, queueStorage)
+  const repository = createBoardRepository({ storage: {
+    async getWithVersion() { return { value: { byBoard: [] }, version: 'bad-map' } },
+  } })
+  const result = await replayPendingBoardOps('board', async pending => {
+    try {
+      return { status: 'landed', doc: (await repository.mutate('board', pending)).doc }
+    } catch (error) {
+      return replayOutcomeForBoardError(error)
+    }
+  }, { storage: queueStorage })
+  assert.equal(result.ok, false)
+  assert.equal(result.pending, 1)
+  assert.deepEqual((await readPendingBoardOps('board', queueStorage))[0].op, op)
 })
 
 test('shared poll/write/subscription race keeps the versioned poll as sole authority', () => {
@@ -132,17 +195,46 @@ test('component-level viewer and keyboard contract gates writes, reorders, and m
   assert.deepEqual(doc.columns[0].cardIds, ['a', 'c', 'b'])
 
   const boardSource = await readFile(new URL('../ui/Board.jsx', import.meta.url), 'utf8')
+  const appSource = await readFile(new URL('../index.jsx', import.meta.url), 'utf8')
   const focusSource = await readFile(new URL('../ui/modalFocus.js', import.meta.url), 'utf8')
   const themeSource = await readFile(new URL('../theme.js', import.meta.url), 'utf8')
   assert.match(boardSource, /if \(!boardAccess\(entry, onlineRef\.current\)\.canWrite\) return false/)
   assert.match(boardSource, /<h3>Position<\/h3>/)
   assert.match(boardSource, /Move up/)
   assert.match(boardSource, /Move down/)
+  assert.ok(
+    boardSource.indexOf('<h3>Checklist</h3>') < boardSource.indexOf('className="kb-property-list kb-mobile-only"'),
+    'the phone checklist stays between notes and card properties',
+  )
+  assert.match(boardSource, /className="kb-card-danger-zone kb-mobile-only"/)
+  assert.match(boardSource, /className="kb-btn kb-btn-danger kb-delete-card"/)
+  assert.match(boardSource, /className="kb-btn kb-btn-primary kb-card-toolbar-done"/)
+  assert.doesNotMatch(boardSource, /kb-card-more-heading/)
   assert.match(boardSource, /role="radiogroup"/)
   assert.match(boardSource, /role="radio" aria-checked=/)
+  assert.match(boardSource, /function AssigneePicker/)
+  assert.match(boardSource, />Assign to me</)
+  assert.match(boardSource, /placeholder=\{share \? 'Search people…' : 'Search or enter a name…'\}/)
+  assert.doesNotMatch(boardSource, /<select/)
+  assert.match(boardSource, /<BoardPresence members=\{members\}/)
+  assert.match(boardSource, /await onRefreshMembers\?\.\(\)/)
+  assert.match(boardSource, /kb-card-notes/)
+  assert.match(boardSource, /Attach files/)
+  assert.match(boardSource, /onPaste=\{attachFromPaste\}/)
+  assert.match(boardSource, /consumeAttachmentPaste/)
+  assert.match(boardSource, /MAX_CARD_ATTACHMENTS/)
+  assert.match(boardSource, /loadCardAttachment/)
+  assert.match(themeSource, /\.kb-col-status \{[^}]*margin-right: 4px;/s)
+  assert.match(appSource, /setInterval\(check, 3000\)/)
+  assert.match(appSource, /document\.addEventListener\('visibilitychange', check\)/)
   assert.match(focusSource, /event\.key === 'Escape'/)
   assert.match(focusSource, /event\.key !== 'Tab'/)
+  assert.match(focusSource, /if \(!isTopmost\(\)\) return/)
   assert.match(focusSource, /opener\.focus\(\)/)
   assert.match(themeSource, /\.kb-position-actions \.kb-btn[^}]*min-height: 44px/s)
-  assert.match(themeSource, /\.kb-col-reorder \.kb-col-action \{ width: 36px; height: 36px; \}/)
+  assert.match(themeSource, /\.kb-status-seg button \{[^}]*min-height: 44px/s)
+  assert.match(themeSource, /\.kb-col-reorder \.kb-col-action \{ width: 44px; height: 44px; \}/)
+  assert.match(themeSource, /\.kb-input, \.kb-col-name \{ font-size: 16px; \}/)
+  assert.match(themeSource, /\.kb-swatches \{ flex-wrap: nowrap; gap: 4px; overflow-x: auto;/)
+  assert.match(themeSource, /\.kb-sheet \{[^}]*top: max\(8px, env\(safe-area-inset-top\)\)/s)
 })

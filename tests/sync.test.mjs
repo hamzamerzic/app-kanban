@@ -9,10 +9,44 @@ import {
   joinWithInvite,
   leaveBoard,
   loadShareMap,
+  getSharedAsset,
+  putSharedAsset,
+  deleteSharedAsset,
   pushSharedOp,
   removeShareEntry,
   shareBoard,
+  sharedBoardPollDelay,
 } from '../sync.js'
+
+test('an actively viewed shared board polls quickly and relaxes when idle', () => {
+  assert.equal(sharedBoardPollDelay(10_000, 20_000), 1000)
+  assert.equal(sharedBoardPollDelay(1_000, 20_000), 3000)
+})
+
+test('shared image operations stay scoped to the board host and object', async () => {
+  configureSync('test-token')
+  const calls = []
+  const request = async (url, options = {}) => {
+    calls.push({ url, options })
+    const body = options.method === 'GET' || !options.method
+      ? { status: 'ok', asset: { id: 'image', mime: 'image/webp', data: 'abc' } }
+      : { status: options.method === 'DELETE' ? 'deleted' : 'ok' }
+    return new Response(JSON.stringify(body), { status: 200, headers: { 'content-type': 'application/json' } })
+  }
+  const entry = { host: 'peer.example', oid: 'board-object' }
+  await putSharedAsset(entry, 'image', 'image/webp', 'abc', request)
+  assert.deepEqual(await getSharedAsset(entry, 'image', request), {
+    id: 'image', mime: 'image/webp', data: 'abc',
+  })
+  await deleteSharedAsset(entry, 'image', request)
+  assert.deepEqual(calls.map(call => [call.url, call.options.method || 'GET']), [
+    ['/api/services/common/objects/peer.example/board-object/assets/image', 'PUT'],
+    ['/api/services/common/objects/peer.example/board-object/assets/image', 'GET'],
+    ['/api/services/common/objects/peer.example/board-object/assets/image', 'DELETE'],
+  ])
+  assert.equal(calls[0].options.headers.Authorization, 'Bearer test-token')
+  assert.deepEqual(JSON.parse(calls[0].options.body), { mime: 'image/webp', data: 'abc' })
+})
 
 test.afterEach(() => {
   delete globalThis.window
@@ -37,7 +71,7 @@ test('creating a shareable invite omits the address from the request', async () 
   }
 
   const result = await createInvite('object', 'viewer')
-  assert.equal(request.url, '/api/common/objects/object/invites')
+  assert.equal(request.url, '/api/services/common/objects/object/invites')
   assert.equal(request.options.method, 'POST')
   assert.deepEqual(request.body, { role: 'viewer' })
   assert.equal(result.invite, 'object@host.example#secret')
@@ -76,7 +110,7 @@ test('accepting an invitation durably saves both the board and membership', asyn
     async getWithVersion() { return { value: null, version: null } },
   } } }
   globalThis.fetch = async (url, options) => {
-    assert.equal(url, '/api/common/objects/join')
+    assert.equal(url, '/api/services/common/objects/join')
     assert.equal(options.headers.Authorization, 'Bearer test-token')
     return new Response(JSON.stringify({
       membership: { id: 'remote-id', host: 'peer.example', role: 'viewer', label: 'Shared' },
@@ -105,7 +139,7 @@ test('joining with an invite sends the capability string and sets up the local b
     async getWithVersion() { return { value: null, version: null } },
   } } }
   globalThis.fetch = async (url, options) => {
-    assert.equal(url, '/api/common/objects/join')
+    assert.equal(url, '/api/services/common/objects/join')
     assert.deepEqual(JSON.parse(options.body), {
       app: 'kanban',
       invite: 'remote-id@peer.example#secret',
@@ -197,4 +231,61 @@ test('shared deletion and leave retries treat an already-absent object as succes
     value: { byBoard: {} },
     options: { ifMatch: 'v1' },
   })
+})
+
+test('verified collaborators appear once without merging lookalike handles', async () => {
+  const { groupCollaborators } = await import('../sync.js')
+  const result = groupCollaborators([
+    { host: 'one.example', handle: 'ana', collaborator_id: 'verified-group', pending: true, active: false },
+    { host: 'two.example', handle: 'ana', collaborator_id: 'verified-group', pending: false, active: true },
+    { host: 'other.example', handle: 'ana', pending: true },
+  ])
+  assert.equal(result.length, 2)
+  assert.deepEqual(result[0].hosts, ['one.example', 'two.example'])
+  assert.equal(result[0].pending, false)
+  assert.equal(result[0].active, true)
+})
+
+test('delivery feedback distinguishes partial success and never promises an automatic retry', async () => {
+  const { inviteDeliveryNotice } = await import('../sync.js')
+  const partial = inviteDeliveryNotice({ recipients: [
+    { delivery: 'delivered' }, { delivery: 'unreachable' },
+  ] })
+  assert.equal(partial.kind, 'warn')
+  assert.match(partial.text, /1 of 2/)
+  assert.match(partial.text, /Send again/)
+  assert.equal(inviteDeliveryNotice({ delivery: 'unreachable' }).kind, 'warn')
+  assert.equal(inviteDeliveryNotice({ delivery: 'delivered' }).kind, 'ok')
+  assert.match(inviteDeliveryNotice({ recipients: [{ delivery: 'delivered' }, { delivery: 'delivered' }] }).text, /all 2/)
+})
+
+test('remove collaborator explicitly revokes all grouped deployments, but legacy members stay scoped', async () => {
+  const { revokeCollaborator } = await import('../sync.js')
+  configureSync('test-token')
+  const urls = []
+  globalThis.fetch = async (url, options) => {
+    urls.push(url)
+    assert.equal(options.method, 'DELETE')
+    return new Response(JSON.stringify({ status: 'revoked' }), { status: 200 })
+  }
+  await revokeCollaborator('oid', { host: 'one.example', collaborator_id: 'group' })
+  await revokeCollaborator('oid', { host: 'legacy.example' })
+  assert.deepEqual(urls, [
+    '/api/services/common/objects/oid/members/one.example?all_deployments=true',
+    '/api/services/common/objects/oid/members/legacy.example',
+  ])
+})
+
+test('assignees on any verified deployment retain their collaborator selection without changing the card', async () => {
+  const { groupCollaborators, collaboratorForHost } = await import('../sync.js')
+  const members = groupCollaborators([
+    { host: 'one.example', collaborator_id: 'group', pending: false },
+    { host: 'two.example', collaborator_id: 'group', pending: false },
+    { host: 'other.example', pending: false },
+  ])
+  const card = { assignee: 'Test member', assigneeHost: 'two.example' }
+  assert.equal(collaboratorForHost(members, card.assigneeHost).host, 'one.example')
+  assert.equal(card.assigneeHost, 'two.example')
+  assert.equal(collaboratorForHost(members, 'other.example').host, 'other.example')
+  assert.equal(collaboratorForHost(members, 'unknown.example'), undefined)
 })
